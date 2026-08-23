@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -i '\\\\.xlsx$')",
+      "Bash(grep -i '\\\\.csv$')",
+      "Bash(grep -iE '\\\\.\\(spec|manifest\\)$')",
+      "Bash(git check-ignore *)",
+      "Bash(.venv/Scripts/python.exe _probe_regex.py)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_nokia_card_parser.py -v)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -v)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/)",
+      "Bash(del _probe_regex.py)",
+      "Bash(powershell.exe -Command \"Remove-Item _probe_regex.py\")",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _probe_regex.py\")",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_packing_slip_summary_prune.py -v)",
+      "Bash(.venv/Scripts/python.exe)",
+      "Bash(.venv/Scripts/python.exe _vsdx_inspect.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _vsdx_inspect.py\")",
+      "Bash(.venv/Scripts/python.exe _vsdx_p3_extra_lrs.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _vsdx_p3_extra_lrs.py\")",
+      "Bash(.venv/Scripts/python.exe _vsdx_ports.py)",
+      "Bash(.venv/Scripts/python.exe _vsdx_endpoint_match.py)",
+      "Bash(.venv/Scripts/python.exe _vsdx_dump_line.py)",
+      "Bash(.venv/Scripts/python.exe _vsdx_p3_full.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _vsdx_ports.py _vsdx_endpoint_match.py _vsdx_dump_line.py _vsdx_p3_full.py\")",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _vsdx_p3_full.py\")",
+      "Bash(.venv/Scripts/python.exe _vsdx_bandwidth_labels.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _vsdx_p3_full.py _vsdx_bandwidth_labels.py\")",
+      "Bash(.venv/Scripts/python.exe _bom_chassis_audit.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _bom_chassis_audit.py\")",
+      "Bash(.venv/Scripts/python.exe _bom_p3_drill.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _bom_p3_drill.py\")",
+      "Bash(.venv/Scripts/python.exe _bom_candidates.py)",
+      "Bash(.venv/Scripts/python.exe _visio_find_sites.py)",
+      "Bash(.venv/Scripts/python.exe _bom_p3_final.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _bom_p3_final.py _bom_candidates.py _visio_find_sites.py\")",
+      "Bash(.venv/Scripts/python.exe _p3_final_combined.py)",
+      "Bash(/c/Windows/System32/cmd.exe //c \"del _p3_final_combined.py\")",
+      "Bash(.venv/Scripts/python.exe _p3_fiber_runlist.py)"
+    ]
+  }
+}

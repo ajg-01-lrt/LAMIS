@@ -8,6 +8,11 @@ import sys as _sys
 import os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..', '..'))
 from utils.telnet import Telnet as _Telnet
+from utils.helpers import (
+    get_known_hosts_path as _get_known_hosts_path,
+    safe_load_host_keys as _safe_load_host_keys,
+    safe_save_host_keys as _safe_save_host_keys,
+)
 import re
 import glob
 import ipaddress
@@ -90,6 +95,13 @@ def _parse_startup_args():
     parser.add_argument('--password', dest='password', default='')
     parser.add_argument('--file-name', dest='file_name', default='')
     parser.add_argument('--non-interactive', dest='non_interactive', action='store_true')
+    parser.add_argument('--read-password-stdin', dest='read_password_stdin', action='store_true')
+    parser.add_argument('--validate', dest='validate', action='store_true',
+                        help='Run engineering validations after RLS collection')
+    parser.add_argument('--walk-mode', dest='walk_mode', action='store_true',
+                        help='One hop of a Network Audit walk; relaxes --file-name requirement')
+    parser.add_argument('--hop', dest='hop', type=int, default=0,
+                        help='Hop depth in walk (informational)')
     args, _ = parser.parse_known_args()
     return args
 
@@ -100,8 +112,18 @@ def _resolve_startup_inputs():
     host = (args.host or '').strip()
     platform = (args.platform or '').strip().upper()
     user = (args.username or '').strip()
-    env_pass = os.getenv('TDS_PASSWORD', '')
-    password = args.password if args.password else env_pass
+    
+    # Password priority: stdin (most secure) > --password arg > TDS_PASSWORD env var
+    password = ''
+    if args.read_password_stdin:
+        try:
+            password = sys.stdin.readline().rstrip('\n')
+        except Exception:
+            password = ''
+    elif args.password:
+        password = args.password
+    else:
+        password = os.getenv('TDS_PASSWORD', '')
     expected_tid = (args.file_name or '').strip().upper()
 
     def _validate_host(value):
@@ -133,13 +155,17 @@ def _resolve_startup_inputs():
         sys.exit()
 
     if not expected_tid:
-        print('Missing required --file-name.')
-        sys.exit()
+        if args.walk_mode:
+            expected_tid = ''  # discovered hosts may not have a known TID up front
+        else:
+            print('Missing required --file-name.')
+            sys.exit()
 
-    return (host, platform, user, password, expected_tid)
+    return (host, platform, user, password, expected_tid,
+            bool(args.validate), bool(args.walk_mode), int(args.hop or 0))
 
 
-HOST, PLATFORM_MODE, USER, PASS, EXPECTED_TID = _resolve_startup_inputs()
+HOST, PLATFORM_MODE, USER, PASS, EXPECTED_TID, RUN_VALIDATIONS, WALK_MODE, WALK_HOP = _resolve_startup_inputs()
 
 if PLATFORM_MODE == '6500':
     METHOD = 'TELNET'
@@ -201,7 +227,7 @@ elif PORT == '23':
 else:
     PROMPT = '\r\n;'
 
-F_DBG = open('Debug.txt', 'w')
+F_DBG = open(str(_get_known_hosts_path().parent / 'TDS_Debug.txt'), 'w')
 F_DBG.write('\nScript Version = ' + SCRIPT_VERSION + '\n####################\n\n')
 class _LazyWriter:
     def __init__(self, path):
@@ -220,7 +246,7 @@ class _LazyWriter:
             self.handle = None
 
 
-F_MISS = _LazyWriter('MissingTID.txt')
+F_MISS = _LazyWriter(str(_get_known_hosts_path().parent / 'TDS_MissingTID.txt'))
 WindowsHostName = HOST.replace(':', '^')
 def LOGIN_SSH():
     global chan_6500
@@ -233,9 +259,12 @@ def LOGIN_SSH():
             if not _ensure_paramiko():
                 return 'NO'
             try:
+                _kh = str(_get_known_hosts_path())
                 ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                _safe_load_host_keys(ssh, _kh)
+                ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
                 ssh.connect(HOST, port=int(PORT), username=USER, password=PASS, timeout=TIMEOUT)
+                _safe_save_host_keys(ssh, _kh)
                 chan_6500 = ssh.invoke_shell()
                 return 'YES'
             except Exception as err:
@@ -253,7 +282,11 @@ def LOGIN_SSH():
 def LOGIN_TELNET():
     global telnet_6500
     try:
-        telnet_6500 = _Telnet(HOST, PORT, TIMEOUT)
+        # F004: Ciena 6500 TL1 prompt is only available on the Telnet listener;
+        # SSH cannot speak TL1. Bypass policy here so this required path is not
+        # blocked by the deny-all default.
+        telnet_6500 = _Telnet(HOST, PORT, TIMEOUT,
+                              bypass_policy=True, purpose="tl1-6500")
         return 'YES'
     except Exception as err:
         F_DBG.write('\nTELNET Connection Error: %s' % str(err))
@@ -278,9 +311,12 @@ def RLS_LOGIN_SSH():
     if not _ensure_paramiko():
         return 'NO'
     try:
+        _kh = str(_get_known_hosts_path())
         rls_ssh_client = paramiko.SSHClient()
-        rls_ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        _safe_load_host_keys(rls_ssh_client, _kh)
+        rls_ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
         rls_ssh_client.connect(HOST, port=int(PORT), username=USER, password=PASS, timeout=TIMEOUT, look_for_keys=False, allow_agent=False)
+        _safe_save_host_keys(rls_ssh_client, _kh)
         rls_chan = rls_ssh_client.invoke_shell()
         time.sleep(2)
         banner = ''
@@ -1340,6 +1376,11 @@ def _consolidate_rls_csv_to_xlsx(WindowsHost, tid_label='', cleanup_csvs=True):
     all_csv_paths = glob.glob(WindowsHost + '_RLS_*.csv')
     priority = {
         WindowsHost + '_RLS_Issues.csv': 0,
+        # Engineering-level verdicts produced by the validation step (when
+        # the run was invoked with --validate). Slotted right after Issues
+        # so the operator sees PASS/WARN/FAIL/INFO judgements before
+        # diving into raw command output.
+        WindowsHost + '_RLS_Validation.csv': 1,
         WindowsHost + '_RLS_Adjacencies.csv': 2,
         WindowsHost + '_RLS_Alarms.csv': 3,
         WindowsHost + '_RLS_Amplifiers.csv': 4,
@@ -1371,9 +1412,14 @@ def _consolidate_rls_csv_to_xlsx(WindowsHost, tid_label='', cleanup_csvs=True):
         WindowsHost + '_RLS_Tx_Adjacency.csv': 32,
         WindowsHost + '_RLS_Software.csv': 33,
         WindowsHost + '_RLS_LLDP.csv': 35,
+        # LLDP neighbor topology snapshot produced by the audit's walk
+        # mode (--walk-mode). Placed at the end so the workbook reads
+        # device-detail first, network-level info last.
+        WindowsHost + '_RLS_Walk_Neighbors.csv': 36,
     }
     display_names = {
         WindowsHost + '_RLS_Issues.csv': 'Issues',
+        WindowsHost + '_RLS_Validation.csv': 'Validation',
         WindowsHost + '_RLS_Adjacencies.csv': 'Adjacencies',
         WindowsHost + '_RLS_Alarms.csv': 'Alarms',
         WindowsHost + '_RLS_Amplifiers.csv': 'Amplifiers',
@@ -1405,9 +1451,11 @@ def _consolidate_rls_csv_to_xlsx(WindowsHost, tid_label='', cleanup_csvs=True):
         WindowsHost + '_RLS_Tx_Adjacency.csv': 'Tx_Adjacency',
         WindowsHost + '_RLS_Software.csv': 'Software',
         WindowsHost + '_RLS_LLDP.csv': 'LLDP',
+        WindowsHost + '_RLS_Walk_Neighbors.csv': 'Walk_Neighbors',
     }
     index_descriptions = {
         'Issues': 'Photonic Issues',
+        'Validation': 'Engineering validation verdicts (PASS / WARN / FAIL / INFO)',
         'Adjacencies': 'Adjacency and discovered neighbor summary',
         'Alarms': 'Active and disabled alarm conditions',
         'Amplifiers': 'Amplifier and line-card power summary',
@@ -1439,6 +1487,7 @@ def _consolidate_rls_csv_to_xlsx(WindowsHost, tid_label='', cleanup_csvs=True):
         'Tx_Adjacency': 'Transmit adjacencies',
         'Software': 'Software versions and upgrade state',
         'LLDP': 'LLDP neighbors and management addresses',
+        'Walk_Neighbors': 'Network-walk neighbor topology (interface / system / mgmt-address / port)',
     }
     csv_paths = sorted(all_csv_paths, key=lambda p: (priority.get(p, 100), os.path.basename(p).lower()))
     keep_raw_tabs = set()
@@ -2332,7 +2381,12 @@ def PARSE_COLLECTED_DATA_RLS(WindowsHost):
 
     xlsx_path = _consolidate_rls_csv_to_xlsx(WindowsHost, display_tid, cleanup_csvs=False)
     debug_xlsx_path = _consolidate_rls_csv_to_debug_xlsx(WindowsHost, display_tid)
-    _cleanup_rls_csv_artifacts(glob.glob(WindowsHost + '_RLS_*.csv'))
+    # In walk mode the per-host CSVs are consumed by RLS_Network_Audit.py
+    # to build a span-wide workbook, so suppress the cleanup here. The
+    # audit orchestrator removes them after the network workbook is
+    # written.
+    if not WALK_MODE:
+        _cleanup_rls_csv_artifacts(glob.glob(WindowsHost + '_RLS_*.csv'))
 
     if xlsx_path:
         print('6500 RLS workbook generated: ' + xlsx_path)
@@ -2342,7 +2396,50 @@ def PARSE_COLLECTED_DATA_RLS(WindowsHost):
     
     if debug_xlsx_path:
         print('6500 RLS Debug workbook generated: ' + debug_xlsx_path)
-    
+
+    if RUN_VALIDATIONS:
+        try:
+            import rls_validations
+            host_data = {
+                'expected_tid': expected_tid_clean,
+                'detected_tid': detected_tid,
+                'active_version': active_version,
+                'running_version': running_version,
+                'committed_version': committed_version,
+                'cpu_idle': cpu_idle,
+                'mem_used': mem_used,
+                'critical': critical,
+                'major': major,
+                'minor': minor,
+                'warning': warning,
+                'osc_neighbor_ifaces': [i for i in neighbor_ifaces if 'osc' in (i or '').lower()],
+                'osc_power_map': osc_power_map,
+                'total_ok': total_ok,
+                'total_warn': total_warn,
+            }
+            verdicts = rls_validations.run_validations(host_data)
+            validation_csv = WindowsHost + '_RLS_Validation.csv'
+            rls_validations.write_csv(verdicts, validation_csv)
+            counts = rls_validations.summarize(verdicts)
+            print('Validations: PASS=%d WARN=%d FAIL=%d INFO=%d -> %s' % (
+                counts.get('PASS', 0), counts.get('WARN', 0),
+                counts.get('FAIL', 0), counts.get('INFO', 0), validation_csv))
+        except Exception as _verr:
+            print('Validation step failed: %s' % str(_verr))
+            F_DBG.write('\nValidation step failed: %s\n' % str(_verr))
+
+    if WALK_MODE:
+        try:
+            walk_neighbors_csv = WindowsHost + '_RLS_Walk_Neighbors.csv'
+            with open(walk_neighbors_csv, 'w', newline='') as _f:
+                _w = csv.writer(_f)
+                _w.writerow(['Interface', 'Neighbor System Name', 'Management Address', 'Neighbor Port'])
+                for iface, system_name, mgmt_addr, port_id in neighbor_details:
+                    _w.writerow([iface, system_name or '', mgmt_addr or '', port_id or ''])
+            print('Walk neighbors written: ' + walk_neighbors_csv)
+        except Exception as _werr:
+            print('Walk neighbor export failed: %s' % str(_werr))
+
     return ErrorMessage
 
 
@@ -6723,7 +6820,9 @@ def MCEMON_STATUS(mcemonPort):
         mon_6500.close()
     elif METHOD == 'TELNET':
         try:
-            tel_6500 = _Telnet(HOST, mcemonPort, mTimeout)
+            # F004: TL1 mcemon channel uses a Telnet-only TL1 prompt.
+            tel_6500 = _Telnet(HOST, mcemonPort, mTimeout,
+                               bypass_policy=True, purpose="tl1-mcemon")
         except:
             wasConnected = 'No telnet for this IP'
             return mcemon
@@ -16360,7 +16459,9 @@ def LOGIN_TELNET():
     f1 = 'Trying to login to ' + HOST + ':' + PORT + '...'
     try:
         print (f1)
-        telnet_6500 = _Telnet(HOST, PORT, TIMEOUT)
+        # F004: TL1 prompt only on Telnet — bypass policy.
+        telnet_6500 = _Telnet(HOST, PORT, TIMEOUT,
+                              bypass_policy=True, purpose="tl1-6500")
     except:
         wasConnected = 'No telnet for this IP'
         F_DBG.write('%s \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Premature Ending of %s %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\n\n' % (wasConnected, HOST))

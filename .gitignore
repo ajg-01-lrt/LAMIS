@@ -183,3 +183,68 @@ cython_debug/
 
 # Visual Studio Code configuration data
 .vscode/
+
+# OS/editor noise
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# ============================================================================
+# CREDENTIALS & ENCRYPTION KEYS - NEVER COMMIT THESE
+# ============================================================================
+.creds_key
+credentials_config.json
+
+# ============================================================================
+# LOCAL SCRATCH / VALIDATION ARTIFACTS
+# ============================================================================
+# Underscore-prefixed scratch files (covers _build.log, _build2.log,
+# _writetest.txt, and any future scratch files following the same pattern)
+_*.log
+_*.txt
+_validate/
+
+# ============================================================================
+# ATLAS RUNTIME ARTIFACTS & TRANSIENT FILES
+# ============================================================================
+# Office lock files (Word/Excel write a transient ~$prefixed copy while a
+# document is open; never useful in version control)
+~$*
+
+# Manual snapshot backups produced ad-hoc during refactors (e.g.
+# ATLAS_Development_Document.PRE-NETBOX-UPDATE.docx)
+*.PRE-*
+*.bak
+*.backup
+*.orig
+
+# Per-run inventory, packing slip, and audit outputs that may land in the
+# repo root during in-tree development. The trailing "_*" anchor keeps
+# these patterns from matching the canonical templates under data/
+# (which have no trailing "_<date>" suffix).
+*_Inventory_*.xlsx
+*_Packing_Slip_*.xlsx
+*_Packing_Slips_*.xlsx
+*_Device_Report_*.xlsx
+*_RLS_Validation.csv
+*_RLS_Walk_Neighbors.csv
+Walk_Summary*.csv
+
+# NETCONF diagnostic captures dumped by tools/netconf_dump.py and
+# tools/netconf_getconfig.py (per-device config/state XML trees). These are
+# customer/lab equipment captures and must never be committed.
+netconf_dump_*/
+netconf_config_*/
+
+# Ad-hoc debug logs and per-device debug/audit workbooks dropped during
+# in-tree development and TDS/RLS troubleshooting.
+Debug.txt
+_*.xlsx
+scripts/TDS/*_Debug.xlsx
+scripts/TDS/TDS_Debug.txt
+scripts/TDS/*_RLS_Network.xlsx
+scripts/TDS/*_RLS.xlsx

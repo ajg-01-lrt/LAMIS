@@ -1,31 +1,36 @@
 import os
 import logging
 import re
+import ipaddress
 import time
 from tkinter import messagebox
 import pandas as pd
+import paramiko
 from openpyxl import load_workbook
 from typing import Callable, Dict, List, Optional, Tuple
-from script_interface import BaseScript, CommandTracker, DatabaseCache, get_inventory_db_path, get_tracker, get_cache
+from script_interface import BaseScript, CommandTracker, DatabaseCache, get_inventory_db_path, get_tracker, get_cache, NEEDS_CREDENTIALS_SENTINEL
+from utils.helpers import ensure_host_key_known, get_known_hosts_path, safe_load_host_keys, safe_save_host_keys
 from utils.telnet import Telnet
 
 try:
-    from wexpect import spawn, EOF, TIMEOUT
+    from wexpect import spawn, EOF, TIMEOUT  # type: ignore[import-not-found]
 except ImportError:
-    from redexpect import spawn, EOF, TIMEOUT
+    from pexpect import spawn, EOF, TIMEOUT  # type: ignore[import-not-found]
 
 
 class Script(BaseScript):
     def __init__(self, *,
                  connection_type='telnet',
                  command_tracker=None,
-                 ip_address,
-                 username='admin',
+                 ip_address=None,
+                 username='su',
                  password='admin',
                  timeout=5,
                  db_path=None,
                  db_cache=None,
-                 stop_callback=None):
+                 stop_callback=None,
+                 serial_port=None,
+                 baud_rate=None):
         # --- DB wiring ---
         if db_cache is not None:
             self.db_cache = db_cache
@@ -49,9 +54,22 @@ class Script(BaseScript):
         self.timeout = timeout
         self.port = 22
         self.stop_callback = stop_callback
+        # Serial-mode state. ``baud_rate`` may be None (the GUI doesn't
+        # know the device's actual rate), in which case
+        # ``execute_serial_commands`` probes the standard RLS speeds.
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
+        self.serial_port_obj = None
 
-        if not self.ip_address:
-            raise ValueError("Missing required 'ip_address' for network-based connection.")
+        # Network-based connections need an IP; serial doesn't.
+        if connection_type in ("telnet", "ssh") and not self.ip_address:
+            raise ValueError(
+                f"Missing required 'ip_address' for {connection_type} connection."
+            )
+        if connection_type == "serial" and not self.serial_port:
+            raise ValueError(
+                "Missing required 'serial_port' for serial connection."
+            )
 
     # ------------------------------------------------------------------
     # Abort / stop helpers
@@ -77,6 +95,19 @@ class Script(BaseScript):
 
     def should_stop(self) -> bool:
         return bool(self.stop_callback and self.stop_callback())
+
+    def _resolve_tid(self, output: str = "") -> str:
+        """Return the device TID, preferring the prompt captured at SSH login.
+
+        Falls back to scanning *output* for an embedded ``hostname#`` prompt
+        line, which is useful for offline parsing of pre-captured logs.
+        """
+        cached = getattr(self, "system_tid", "")
+        if cached:
+            return cached
+        if output:
+            return self._extract_hostname(output)
+        return ""
 
     def sleep_with_abort(self, seconds: float, interval: float = 0.1) -> bool:
         end_time = time.time() + seconds
@@ -104,14 +135,9 @@ class Script(BaseScript):
     def get_commands(self) -> List[str]:
         return [
             'show shelf',                                        # shelf name + type info
-            'show slots * inventory',                            # shelf / slot hardware summary
             'show slots * inventory circuit-pack',               # card inventory
             'show slots * inventory slots *',                    # module / pluggable inventory
             'show software',                                     # software release info
-            'show slots *',                                      # slot programming state
-            'show aps',                                          # APS line protection switch
-            'show components component power-supply state',      # power supply status
-            'show lldp interfaces',                              # LLDP port topology
         ]
 
     # ------------------------------------------------------------------
@@ -121,6 +147,8 @@ class Script(BaseScript):
     def execute_commands(self, commands: List[str]) -> Tuple[List[str], Optional[str]]:
         if self.connection_type == 'ssh':
             return self.execute_ssh_commands(commands)
+        if self.connection_type == 'serial':
+            return self.execute_serial_commands(commands)
 
         outputs = []
         for command in commands:
@@ -147,99 +175,207 @@ class Script(BaseScript):
         return outputs, None if all(outputs) else "Some commands failed"
 
     def execute_ssh_commands(self, commands: List[str]) -> Tuple[List[str], Optional[str]]:
+        """Run *commands* over an interactive paramiko SSH shell.
+
+        Replaces the previous wexpect/pexpect approach which silently hung
+        on Windows when spawning ssh.exe. Paramiko is already proven to
+        work for this exact host (it's used during identification), and
+        every meaningful step here logs at INFO so the operator can see
+        progress in the console / log file.
+        """
         try:
-            ssh_cmd = (
-                f"ssh -o StrictHostKeyChecking=no "
-                f"-o HostKeyAlgorithms=+ssh-rsa "
-                f"-o PubkeyAcceptedKeyTypes=+ssh-rsa "
-                f"-p {self.port} {self.ip_address}"
-            )
-            logging.debug(f"Spawning SSH process to {self.ip_address}:{self.port}")
-            self.child = spawn(ssh_cmd, encoding='utf-8', timeout=30)
-
-            output_log = []
-
-            idx = self.expect_with_abort(
-                self.child,
-                ["[Ll]ogin:", "Are you sure you want to continue connecting", EOF, TIMEOUT],
-                timeout=30,
-            )
-            if idx is None:
-                self.child.close(force=True)
-                self.child = None
-                return [], "Aborted"
-            if idx == 1:
-                self.child.sendline("yes")
-                idx = self.expect_with_abort(self.child, ["[Ll]ogin:", EOF, TIMEOUT], timeout=30)
-                if idx is None:
-                    self.child.close(force=True)
-                    self.child = None
-                    return [], "Aborted"
-
-            self.child.sendline(self.username)
-            if self.expect_with_abort(self.child, "[Pp]assword:", timeout=30) is None:
-                self.child.close(force=True)
-                self.child = None
-                return [], "Aborted"
-            self.child.sendline(self.password)
-
-            idx = self.expect_with_abort(self.child, [r"[#]", EOF, TIMEOUT], timeout=30)
-            if idx is None:
-                self.child.close(force=True)
-                self.child = None
-                return [], "Aborted"
-            if idx in [1, 2]:
-                logging.error("SSH authentication failed")
-                return [], "Authentication failed"
-
-            prompt = self.child.after.strip()
-            logging.debug(f"Detected SSH prompt: '{prompt}'")
-
-            for cmd in commands:
-                if self.should_stop():
-                    self.child.close(force=True)
-                    self.child = None
-                    return output_log, "Aborted"
-                logging.debug(f"Sending SSH command: {cmd}")
-                self.child.sendline(cmd)
-                if self.expect_with_abort(self.child, cmd, timeout=30) is None:
-                    self.child.close(force=True)
-                    self.child = None
-                    return output_log, "Aborted"
-                full_output = ""
-                while True:
-                    index = self.expect_with_abort(self.child, [prompt, EOF, TIMEOUT], timeout=30)
-                    if index is None:
-                        self.child.close(force=True)
-                        self.child = None
-                        return output_log, "Aborted"
-                    chunk = self.child.before
-                    full_output += chunk
-                    if index == 0:
-                        full_output += self.child.after
-                        break
-                    elif index == 1:
-                        logging.warning("EOF while waiting for SSH prompt")
-                        break
-                    elif index == 2:
-                        logging.error("Timeout waiting for SSH prompt")
-                        break
-                output_log.append(full_output.strip())
-                self.command_tracker.mark_as_executed(self.ip_address, cmd, self.connection_type)
-
-            self.child.sendline("exit")
             try:
-                self.expect_with_abort(self.child, [prompt, EOF, TIMEOUT], timeout=10)
-            except TIMEOUT:
-                logging.warning("Timeout after SSH 'exit', force closing")
-            self.child.close(force=True)
-            self.child = None
+                ipaddress.ip_address(self.ip_address)
+            except ValueError:
+                return [], f"Invalid IP address format: {self.ip_address}"
+
+            if not re.match(r'^[a-zA-Z0-9._-]+$', self.username):
+                return [], f"Invalid username format: {self.username}"
+
+            kh_path = str(get_known_hosts_path())
+            logging.info(
+                f"[RLS] Pre-verifying host key for {self.ip_address}:{self.port}"
+            )
+            if not ensure_host_key_known(str(self.ip_address), port=self.port):
+                return [], (
+                    f"SSH host key verification failed or rejected for "
+                    f"{self.ip_address}:{self.port}"
+                )
+
+            client = paramiko.SSHClient()
+            safe_load_host_keys(client, kh_path)
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+            logging.info(
+                f"[RLS] Connecting paramiko SSH to "
+                f"{self.username}@{self.ip_address}:{self.port}"
+            )
+            try:
+                client.connect(
+                    self.ip_address,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
+                    timeout=15,
+                    banner_timeout=15,
+                    auth_timeout=15,
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+            except paramiko.AuthenticationException as ae:
+                logging.error(f"[RLS] SSH auth failed for {self.ip_address}: {ae}")
+                client.close()
+                return [], NEEDS_CREDENTIALS_SENTINEL
+            except Exception as ce:
+                logging.exception(f"[RLS] SSH connect failed for {self.ip_address}")
+                client.close()
+                return [], f"SSH connect error: {ce}"
+
+            logging.info(f"[RLS] SSH session established for {self.ip_address}")
+            session = client.invoke_shell(width=200, height=10000)
+            session.settimeout(30)
+
+            # Drain login banner, then detect the actual prompt suffix so we
+            # know when each command's output has finished. RLS prompts look
+            # like `lrt2.bb.net.apple.com#`.
+            #
+            # The RLS is slow to settle after auth — it dumps a multi-line
+            # banner, sometimes pauses, then prints the prompt. Wait a beat
+            # for it to flush, then keep nudging with newlines (up to a few
+            # times) until we actually see a `hostname#` prompt.
+            time.sleep(2.0)
+            login_banner = self._drain_paramiko_shell(session, idle_seconds=1.5, max_wait=8.0)
+            logging.debug(f"[RLS] Login banner ({len(login_banner)} chars):\n{login_banner}")
+
+            prompt_match = re.search(r"([A-Za-z0-9._\-]+#)\s*$", login_banner)
+            for nudge in range(1, 6):
+                if prompt_match:
+                    break
+                if self.should_stop():
+                    return [], "Aborted"
+                logging.info(
+                    f"[RLS] No prompt yet for {self.ip_address}; "
+                    f"sending newline nudge #{nudge}"
+                )
+                session.send("\n")
+                time.sleep(1.0)
+                login_banner += self._drain_paramiko_shell(
+                    session, idle_seconds=1.0, max_wait=4.0
+                )
+                prompt_match = re.search(r"([A-Za-z0-9._\-]+#)\s*$", login_banner)
+            if not prompt_match:
+                logging.error(
+                    f"[RLS] Could not detect shell prompt for {self.ip_address} "
+                    f"after 5 nudges. Last 200 chars: {login_banner[-200:]!r}"
+                )
+                try: session.close()
+                except Exception: pass
+                client.close()
+                return [], "Could not detect shell prompt"
+            prompt = prompt_match.group(1)
+            logging.info(f"[RLS] Detected prompt {prompt!r} for {self.ip_address}")
+            tid_match = re.match(r'([A-Za-z0-9][\w.\-]*)[#>]', prompt)
+            if tid_match:
+                self.system_tid = tid_match.group(1)
+                logging.info(f"[RLS] Captured TID {self.system_tid!r} for {self.ip_address}")
+
+            output_log: List[str] = []
+            try:
+                for cmd in commands:
+                    if self.should_stop():
+                        return output_log, "Aborted"
+                    logging.info(f"[RLS] {self.ip_address} >> {cmd}")
+                    session.send(cmd + "\n")
+                    cmd_out = self._read_until_prompt(session, prompt, timeout=60)
+                    if cmd_out is None:
+                        logging.warning(f"[RLS] Timeout waiting for prompt after '{cmd}'")
+                        output_log.append("")
+                        continue
+                    logging.debug(f"[RLS] '{cmd}' returned {len(cmd_out)} bytes")
+                    output_log.append(cmd_out.strip())
+                    self.command_tracker.mark_as_executed(
+                        self.ip_address, cmd, self.connection_type
+                    )
+            finally:
+                try:
+                    session.send("exit\n")
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+                try: session.close()
+                except Exception: pass
+                try: client.close()
+                except Exception: pass
+
+            logging.info(
+                f"[RLS] Completed {len(output_log)}/{len(commands)} commands for {self.ip_address}"
+            )
             return output_log, None
 
         except Exception as e:
             logging.exception("SSH execution exception")
-            self.child = None
             return [], str(e)
+
+    @staticmethod
+    def _drain_paramiko_shell(session, idle_seconds: float = 1.0, max_wait: float = 5.0) -> str:
+        """Read everything available from a paramiko shell until idle."""
+        deadline = time.time() + max_wait
+        last_read = time.time()
+        buf = bytearray()
+        while time.time() < deadline:
+            if session.recv_ready():
+                chunk = session.recv(65535)
+                if chunk:
+                    buf.extend(chunk)
+                    last_read = time.time()
+            else:
+                if time.time() - last_read >= idle_seconds and buf:
+                    break
+                time.sleep(0.1)
+        return buf.decode("utf-8", errors="replace")
+
+    def _read_until_prompt(self, session, prompt: str, timeout: float = 60.0) -> Optional[str]:
+        """Read from session until *prompt* appears at the end of the buffer.
+
+        Crucially, the prompt must be the LAST non-whitespace content in the
+        buffer — not just present somewhere inside it. Otherwise we'd match
+        the command echo line (`lrt2.bb.net.apple.com# show aps\\n`), which
+        starts with the prompt verbatim, and return before any real output
+        arrives. We also enforce a small idle window after the prompt match
+        so multi-page output (with `--More--`-style flushes that pause
+        briefly) doesn't get truncated.
+        """
+        deadline = time.time() + timeout
+        buf = bytearray()
+        prompt_b = prompt.encode("utf-8")
+        while time.time() < deadline:
+            if self.should_stop():
+                return None
+            if session.recv_ready():
+                chunk = session.recv(65535)
+                if chunk:
+                    buf.extend(chunk)
+            else:
+                # Strip CR + trailing whitespace, then check whether the
+                # prompt is the last thing in the buffer. Require at least
+                # one newline before it so we don't match the echoed
+                # command line.
+                stripped = bytes(buf).replace(b"\r", b"").rstrip()
+                if stripped.endswith(prompt_b) and b"\n" in stripped:
+                    # Idle settle: wait briefly to make sure the device
+                    # isn't about to print more (handles re-prompting after
+                    # paged output).
+                    time.sleep(0.4)
+                    if not session.recv_ready():
+                        return buf.decode("utf-8", errors="replace")
+                    # More data arrived — keep reading.
+                    continue
+                time.sleep(0.1)
+        logging.warning(
+            f"[RLS] _read_until_prompt timed out after {timeout:.0f}s "
+            f"(buffer={len(buf)} bytes, tail={bytes(buf[-120:])!r})"
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Telnet helpers
@@ -291,6 +427,127 @@ class Script(BaseScript):
                         logging.debug(f"Error closing Telnet after failed login: {close_err}")
 
         return False
+
+    # ------------------------------------------------------------------
+    # Serial path
+    # ------------------------------------------------------------------
+
+    # RLS console default credentials. Tried before the encrypted seed
+    # pool on the assumption that most lab gear ships with the factory
+    # password; if a customer has rotated it, the seed pool catches up.
+    _SERIAL_DEFAULT_CREDS: List[Tuple[str, str]] = [("su", "Ciena123")]
+
+    # Baud rates the probe tries when the GUI doesn't pin one. RLS gear
+    # ships at 9600 or 115200 depending on flash image vintage.
+    _SERIAL_DEFAULT_BAUDS: List[int] = [9600, 115200]
+
+    def execute_serial_commands(
+        self, commands: List[str]
+    ) -> Tuple[List[str], Optional[str]]:
+        """Drive the RLS console over a serial port.
+
+        Auto-probes baud rate (9600 / 115200 by default — overridable
+        via ``baud_rate`` in ``__init__``), authenticates using the
+        factory default ``su`` / ``Ciena123`` first then the encrypted
+        seed pool, and runs each command through
+        :func:`utils.serial_helpers.capture_until_prompt`.
+        """
+        try:
+            from utils.serial_helpers import (
+                open_serial_with_baud_probe,
+                serial_login,
+                capture_until_prompt,
+            )
+            from utils.credentials import get_default_credentials_to_try
+        except Exception as exc:
+            logging.error(f"[RLS-SERIAL] Helper import failed: {exc}")
+            return [], f"Serial helpers unavailable: {exc}"
+
+        # Pick the baud list: GUI-specified single rate, else probe both.
+        bauds = (
+            [int(self.baud_rate)] if self.baud_rate
+            else list(self._SERIAL_DEFAULT_BAUDS)
+        )
+
+        # 10s probe timeout (was 2.0s): RLS R4 echoes the wake-CR within
+        # milliseconds but can take 3-6 seconds to actually render the
+        # prompt -- field-confirmed via captured-bytes logging showing
+        # ``hex=0D repr='\r'`` (clean CR echo, no garbage) followed by
+        # silence until the 2s deadline fired. A healthy device only
+        # pays the extra latency once because the probe locks onto the
+        # prompt the moment it arrives.
+        ser = open_serial_with_baud_probe(
+            self.serial_port,
+            bauds,
+            timeout=10.0,
+            should_stop=self.should_stop,
+        )
+        if ser is None:
+            return [], (
+                f"No console prompt detected on {self.serial_port} at "
+                f"{bauds} baud — check cable / device power."
+            )
+        self.serial_port_obj = ser
+
+        try:
+            # Credential ladder: caller-supplied > RLS factory > seed pool.
+            creds: List[Tuple[str, str]] = []
+            if self.username and self.password:
+                creds.append((self.username, self.password))
+            for pair in self._SERIAL_DEFAULT_CREDS:
+                if pair not in creds:
+                    creds.append(pair)
+            for pair in get_default_credentials_to_try():
+                if pair not in creds:
+                    creds.append(pair)
+
+            ok, used = serial_login(
+                ser, creds, timeout=10.0, should_stop=self.should_stop
+            )
+            if not ok:
+                return [], (
+                    f"RLS serial login failed on {self.serial_port}: "
+                    f"all default credentials exhausted."
+                )
+            if used:
+                logging.info(
+                    f"[RLS-SERIAL] Authenticated on {self.serial_port} "
+                    f"as {used[0]!r}"
+                )
+
+            outputs: List[str] = []
+            for command in commands:
+                if self.should_stop():
+                    return outputs, "Aborted"
+                logging.info(f"[RLS-SERIAL] Executing: {command}")
+                output = capture_until_prompt(
+                    ser, command, timeout=30.0,
+                    should_stop=self.should_stop,
+                )
+                if output is None:
+                    error = (
+                        "Aborted" if self.should_stop()
+                        else f"Failed to execute command: {command}"
+                    )
+                    return outputs, error
+                outputs.append(output)
+                # The command tracker keys on (ip, command, ctype); when
+                # running over serial we use the port name as the IP
+                # surrogate so the same key shape works.
+                self.command_tracker.mark_as_executed(
+                    self.serial_port, command, self.connection_type
+                )
+            return outputs, None
+        except Exception as exc:
+            logging.error(f"[RLS-SERIAL] Unhandled error: {exc}")
+            return [], str(exc)
+        finally:
+            try:
+                if self.serial_port_obj is not None:
+                    self.serial_port_obj.close()
+            except Exception:
+                pass
+            self.serial_port_obj = None
 
     def execute_telnet_command(self, command: str) -> Tuple[Optional[str], Optional[str]]:
         try:
@@ -352,27 +609,196 @@ class Script(BaseScript):
     # Output parsers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _strip_rls_noise(output: str) -> str:
+        """Drop CLI prompt lines (``hostname# ...``) and pager prompts."""
+        cleaned = []
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                cleaned.append(line)
+                continue
+            if re.match(r'^\S+[#>]\s*(?:\S.*)?$', stripped):
+                continue
+            if "press any key to continue" in stripped.lower():
+                continue
+            cleaned.append(line)
+        return "\n".join(cleaned)
+
+    @staticmethod
+    def _extract_hostname(output: str) -> str:
+        """Pick the device hostname out of a CLI-prompt line if present.
+
+        Matches both the leading command-echo prompt
+        (``hostname# show shelf``) AND the trailing prompt
+        (``hostname#`` at end of buffer with no trailing whitespace)
+        so the TID is recoverable even when the serial capture
+        stripped the leading echo line.
+        """
+        # ``(?:\s|$)`` -- whitespace OR end-of-line. ``re.MULTILINE``
+        # makes ``$`` match line boundaries, so a bare
+        # ``hostname#`` at end-of-buffer still anchors.
+        m = re.search(
+            r'^([A-Za-z0-9][\w.\-]*)[#>](?:\s|$)',
+            output,
+            re.MULTILINE,
+        )
+        return m.group(1) if m else ""
+
+    @classmethod
+    def _walk_rls_yaml(cls, output: str) -> List[Tuple[Tuple[str, ...], Dict[str, str]]]:
+        """Walk YAML-style indented RLS output and yield ``(path, fields)`` per ``- name : N`` block.
+
+        ``path`` is a tuple of slot names from outermost to innermost
+        (e.g. ``('1',)`` for a top-level slot, ``('1', '50')`` for a
+        nested sub-slot). ``fields`` is a dict of ``key: value`` pairs
+        appearing at any indent strictly greater than the slot marker
+        and before the next sibling/parent slot, attributed to the
+        deepest still-open slot. First-occurrence wins so duplicates
+        from nested blocks (e.g. ``admin-state`` inside ``oscs:``)
+        don't clobber the slot's own value.
+        """
+        cleaned = cls._strip_rls_noise(output)
+        stack: List[Tuple[int, str, Dict[str, str]]] = []
+        results: List[Tuple[Tuple[str, ...], Dict[str, str]]] = []
+
+        name_re = re.compile(r'^-\s*name\s*:\s*(\S+)\s*$')
+        kv_re = re.compile(r'^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$')
+
+        for raw in cleaned.splitlines():
+            line = raw.rstrip()
+            stripped = line.lstrip()
+            if not stripped:
+                continue
+            indent = len(line) - len(stripped)
+
+            m_name = name_re.match(stripped)
+            if m_name:
+                while stack and stack[-1][0] >= indent:
+                    stack.pop()
+                fields: Dict[str, str] = {}
+                stack.append((indent, m_name.group(1), fields))
+                path = tuple(s[1] for s in stack)
+                results.append((path, fields))
+                continue
+
+            m_kv = kv_re.match(stripped)
+            if m_kv and stack:
+                key = m_kv.group(1).lower()
+                value = m_kv.group(2).strip()
+                for entry in reversed(stack):
+                    if entry[0] < indent:
+                        if key not in entry[2]:
+                            entry[2][key] = value
+                        break
+
+        return results
+
     def extract_shelf_detail(
         self,
         output: str,
         cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
         ip: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Parse 'show shelf' — extract system name, PEC, shelf type, and serial number."""
+        """Parse ``show shelf`` — system name, PEC, shelf type, serial number.
+
+        Top-level fields live under a single ``shelf:`` block. Hostname
+        is recovered from any embedded CLI prompt so ``System Name``
+        matches what the operator sees on the device.
+        """
         system_data = []
         try:
-            output = output.strip()
-            name_match = re.search(r"name\s*[:\s]+(\S+)", output, re.IGNORECASE)
-            pec_match = re.search(r"pec\s*[:\s]+(\S+)", output, re.IGNORECASE)
-            ctype_match = re.search(r"c-type\s*[:\s]+(\S+)", output, re.IGNORECASE)
-            serial_match = re.search(r"serial-number\s*[:\s]+(\S+)", output, re.IGNORECASE)
-            shelf_type_match = re.search(r"shelf-type\s*[:\s]+(\S+)", output, re.IGNORECASE)
+            hostname = self._resolve_tid(output)
+            cleaned = self._strip_rls_noise(output)
 
-            system_name = name_match.group(1).strip() if name_match else 'Unknown'
-            pec = pec_match.group(1).strip() if pec_match else ''
-            system_type = ctype_match.group(1).strip() if ctype_match else 'Unknown'
-            serial_number = serial_match.group(1).strip() if serial_match else ''
-            shelf_type = shelf_type_match.group(1).strip() if shelf_type_match else system_type
+            def grab(key: str) -> str:
+                m = re.search(
+                    rf'^\s*{re.escape(key)}\s*:\s*(.+?)\s*$',
+                    cleaned,
+                    re.IGNORECASE | re.MULTILINE,
+                )
+                return m.group(1).strip() if m else ""
+
+            shelf_number = grab("name")
+            pec = grab("pec")
+            ctype = grab("c-type")
+            shelf_type = grab("shelf-type") or ctype
+            serial_number = grab("serial-number")
+            ui_name = grab("ui-name")
+            product = grab("product")
+            # ``node-name`` is present on some RLS firmware builds even
+            # when the CLI prompt didn't carry a TID (early boot,
+            # partial provisioning, factory-default reset). Treat it
+            # as a higher-confidence identifier than the operator-set
+            # ``ui-name`` because it's the device's own hostname.
+            node_name = grab("node-name")
+
+            # Some firmwares populate ``ui-name`` with just the device
+            # model (e.g. ``ui-name: 6500-R4`` on a chassis where
+            # ``shelf-type: 6500-R4 8-Slot`` and ``c-type: 6500-R4
+            # 8-Slot Shelf Assembly``). That's not a real operator-set
+            # alias -- it's a default echoed back at us. Treat it as
+            # "no name" so the priority chain falls through to the
+            # serial-based form (``6500-R4_NNTMRT...``) which actually
+            # disambiguates devices in a multi-chassis workbook.
+            def _ui_name_is_just_device_model(value: str) -> bool:
+                if not value:
+                    return False
+                v = value.strip().lower()
+                if not v:
+                    return False
+                for candidate in (shelf_type, ctype, product):
+                    if candidate and v in candidate.lower():
+                        return True
+                return False
+            ui_name_is_model = _ui_name_is_just_device_model(ui_name)
+
+            # ``shelf-type: 6500-R4 8-Slot`` -- use just the first
+            # token as the model identifier for the fallback name.
+            # Keeps tab names short (``6500-R4_NNTMRT...``) and avoids
+            # spaces, which Excel's sheet-name sanitizer would
+            # otherwise have to scrub.
+            model_token = ""
+            if shelf_type:
+                model_token = shelf_type.split()[0]
+            elif ctype:
+                model_token = ctype.split()[0]
+
+            # Some chassis report ``name: 0`` for the shelf number --
+            # that's not a useful identifier (multiple un-provisioned
+            # shelves would all collapse onto a single ``Shelf 0``
+            # tab). Treat it the same as missing.
+            shelf_number_is_useful = bool(shelf_number) and shelf_number.strip() != "0"
+
+            # Priority chain for the user-facing system name -- each
+            # fall-through was added to fix a specific field case:
+            #
+            # 1. ``hostname`` (from the CLI prompt) -- normal case.
+            # 2. ``node-name`` -- partially provisioned device whose
+            #    prompt lost the hostname but whose ``show shelf``
+            #    block still carries it.
+            # 3. ``ui-name`` -- operator-set shelf alias. Skipped when
+            #    it's just the device model echoed back (see above).
+            # 4. ``<model>_<serial>`` -- the device's hardware identity.
+            #    Far better than ``Shelf 0`` / ``Shelf 1``, which
+            #    collapsed every un-named RLS onto a single tab and
+            #    made multi-device packing slips lose data.
+            # 5. ``Shelf <n>`` -- bay index when nonzero.
+            # 6. ``Unknown`` -- truly anonymous.
+            if hostname:
+                system_name = hostname
+            elif node_name:
+                system_name = node_name
+            elif ui_name and not ui_name_is_model:
+                system_name = ui_name
+            elif model_token and serial_number:
+                system_name = f"{model_token}_{serial_number}"
+            elif shelf_number_is_useful:
+                system_name = f"Shelf {shelf_number}"
+            else:
+                system_name = "Unknown"
+            system_type = ui_name or shelf_type or product or "Unknown"
+            slot_label = ui_name or shelf_type or (f"Shelf {shelf_number}" if shelf_number else system_name)
 
             system_data.append({
                 'System Name': system_name,
@@ -380,13 +806,16 @@ class Script(BaseScript):
                 'Type': 'Shelf',
                 'Part Number': pec,
                 'Serial Number': serial_number,
-                'Description': shelf_type,
-                'Name': system_name,
+                'Description': ctype or shelf_type or product,
+                'Name': slot_label,
                 'Source': ip or 'Unknown',
             })
-            logging.info(f"Extracted shelf detail — Name: {system_name}, Type: {system_type}")
+            logging.info(
+                f"Extracted shelf detail — Name: {system_name}, "
+                f"Type: {system_type}, PEC: {pec}, Serial: {serial_number}"
+            )
         except Exception as e:
-            logging.error(f"Error in extract_shelf_detail: {e}")
+            logging.error(f"Error in extract_shelf_detail: {e}", exc_info=True)
             system_data.append({
                 'System Name': 'Error', 'System Type': 'Error', 'Type': 'Error',
                 'Part Number': 'Error', 'Serial Number': 'Error',
@@ -399,180 +828,62 @@ class Script(BaseScript):
         print(df.to_string(index=False))
         return df
 
-    def extract_shelf_inventory(
-        self,
-        output: str,
-        cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
-        ip: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Parse 'show slots * inventory' — slot-level hardware summary.
-        Expected columns: slot  pec  serial-number  manufacturing-date  hardware-release
-        """
-        shelf_data = []
-        try:
-            output = output.strip()
-            # Match: slot identifier, pec, serial-number from key: value style blocks
-            # Block starts with "slot X:" or "slot X/Y:"
-            slot_blocks = re.split(r'(?=\bslot\s+\S+\s*[:/])', output, flags=re.IGNORECASE)
-            for block in slot_blocks:
-                if not block.strip():
-                    continue
-                slot_match = re.match(r'slot\s+(\S+)', block, re.IGNORECASE)
-                if not slot_match:
-                    continue
-                slot_id = slot_match.group(1).rstrip(':').strip()
-                pec_match = re.search(r'pec\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                serial_match = re.search(r'serial-number\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                hw_match = re.search(r'hardware-release\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                mfg_match = re.search(r'manufacturing-date\s*[:\s]+(\S+)', block, re.IGNORECASE)
-
-                pec = pec_match.group(1).strip() if pec_match else ''
-                serial_number = serial_match.group(1).strip() if serial_match else ''
-                hw_release = hw_match.group(1).strip() if hw_match else ''
-                mfg_date = mfg_match.group(1).strip() if mfg_match else ''
-
-                if not pec and not serial_number:
-                    continue
-
-                description = self.db_cache.lookup_part(pec) if pec else ''
-                shelf_data.append({
-                    'System Name': '',
-                    'System Type': hw_release,
-                    'Type': 'Slot',
-                    'Part Number': pec[:10] if pec else '',
-                    'Serial Number': serial_number,
-                    'Description': description or mfg_date,
-                    'Name': f"Slot {slot_id}",
-                    'Source': ip or 'Unknown',
-                })
-
-            # Fallback: try tabular format  SLOT  PEC  SERIAL
-            if not shelf_data:
-                pattern = re.compile(
-                    r"^\s*(\d+(?:/\S*)?)\s+(\S+)\s+(\S+)(?:\s+(\S+))?",
-                    re.MULTILINE,
-                )
-                for match in pattern.finditer(output):
-                    try:
-                        slot_id = match.group(1).strip()
-                        pec = match.group(2).strip()
-                        serial_number = match.group(3).strip()
-                        hw_release = match.group(4).strip() if match.group(4) else ''
-                        if pec.upper() in ('SLOT', 'PEC', 'SERIAL', 'NAME'):
-                            continue
-                        description = self.db_cache.lookup_part(pec)
-                        shelf_data.append({
-                            'System Name': '',
-                            'System Type': hw_release,
-                            'Type': 'Slot',
-                            'Part Number': pec[:10],
-                            'Serial Number': serial_number,
-                            'Description': description,
-                            'Name': f"Slot {slot_id}",
-                            'Source': ip or 'Unknown',
-                        })
-                    except Exception as me:
-                        logging.error(f"Error processing shelf inventory row: {me}")
-
-            if not shelf_data:
-                logging.warning("No shelf inventory data found.")
-        except Exception as e:
-            logging.error(f"Error in extract_shelf_inventory: {e}")
-
-        df = pd.DataFrame(shelf_data)
-        if cache_callback:
-            cache_callback(df, 'shelf_inventory')
-        print(df.to_string(index=False))
-        return df
-
     def extract_card_inventory(
         self,
         output: str,
         cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
         ip: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Parse 'show slots * inventory circuit-pack' — circuit pack PEC, serial number,
-        hardware release, manufacturing date, power draw and temperature.
+        """Parse ``show slots * inventory circuit-pack`` — circuit-pack PEC,
+        serial number, hardware release, manufacturing date and power.
+
+        Only top-level slots (path length 1) are emitted; sub-slot
+        pluggables come from ``extract_module_inventory`` to avoid duplicates.
         """
         card_data = []
         try:
-            output = output.replace("Press any key to continue (Q to quit)", "").strip()
-            # Split into per-slot blocks
-            slot_blocks = re.split(r'(?=\bslot\s+\S+\s*[:/])', output, flags=re.IGNORECASE)
-            for block in slot_blocks:
-                if not block.strip():
+            for path, fields in self._walk_rls_yaml(output):
+                if len(path) != 1:
                     continue
-                slot_match = re.match(r'slot\s+(\S+)', block, re.IGNORECASE)
-                if not slot_match:
-                    continue
-                slot_id = slot_match.group(1).rstrip(':').strip()
-                pec_match = re.search(r'pec\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                serial_match = re.search(r'serial-number\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                hw_match = re.search(r'hardware-release\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                mfg_match = re.search(r'manufacturing-date\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                power_match = re.search(r'power\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                temp_match = re.search(r'current-temperature\s*[:\s]+(\S+)', block, re.IGNORECASE)
-
-                pec = pec_match.group(1).strip() if pec_match else ''
-                serial_number = serial_match.group(1).strip() if serial_match else ''
-                hw_release = hw_match.group(1).strip() if hw_match else ''
-                mfg_date = mfg_match.group(1).strip() if mfg_match else ''
-                power = power_match.group(1).strip() if power_match else ''
-                temperature = temp_match.group(1).strip() if temp_match else ''
+                slot_id = path[0]
+                pec = fields.get("pec", "")
+                serial_number = fields.get("serial-number", "")
+                hw_release = fields.get("hardware-release", "")
+                mfg_date = fields.get("manufacturing-date", "")
+                ctype = fields.get("c-type", "")
+                power = fields.get("value", "")
+                temperature = fields.get("current-temperature", "")
+                admin_state = fields.get("admin-state", "")
 
                 if not pec and not serial_number:
                     continue
 
-                description = self.db_cache.lookup_part(pec) if pec else ''
-                extras = " | ".join(filter(None, [
-                    f"HW: {hw_release}" if hw_release else '',
-                    f"Mfg: {mfg_date}" if mfg_date else '',
-                    f"Pwr: {power}W" if power else '',
-                    f"Temp: {temperature}C" if temperature else '',
-                ]))
+                description = self.db_cache.lookup_part(pec) if pec else ""
+                if not description:
+                    description = " | ".join(filter(None, [
+                        ctype,
+                        f"HW {hw_release}" if hw_release else "",
+                        f"Mfg {mfg_date}" if mfg_date else "",
+                        f"{power}W" if power else "",
+                        f"{temperature}C" if temperature else "",
+                        admin_state,
+                    ])) or ctype
+
                 card_data.append({
                     'System Name': '',
-                    'System Type': '',
-                    'Type': 'Circuit Pack',
-                    'Part Number': pec[:10] if pec else '',
+                    'System Type': hw_release,
+                    'Type': ctype or 'Circuit Pack',
+                    'Part Number': pec,
                     'Serial Number': serial_number,
-                    'Description': description or extras,
+                    'Description': description,
                     'Name': f"Slot {slot_id}",
                     'Source': ip or 'Unknown',
                 })
 
-            # Fallback: tabular  SLOT  PEC  HW-REL  SERIAL
-            if not card_data:
-                pattern = re.compile(
-                    r"^\s*(\d+(?:/\S*)?)\s+(\S+)\s+(\S+)\s+(\S+)",
-                    re.MULTILINE,
-                )
-                for match in pattern.finditer(output):
-                    try:
-                        slot_id = match.group(1).strip()
-                        pec = match.group(2).strip()
-                        hw_release = match.group(3).strip()
-                        serial_number = match.group(4).strip()
-                        if pec.upper() in ('SLOT', 'PEC', 'HW', 'SERIAL', 'NAME'):
-                            continue
-                        description = self.db_cache.lookup_part(pec)
-                        card_data.append({
-                            'System Name': '',
-                            'System Type': '',
-                            'Type': 'Circuit Pack',
-                            'Part Number': pec[:10],
-                            'Serial Number': serial_number,
-                            'Description': description,
-                            'Name': f"Slot {slot_id}",
-                            'Source': ip or 'Unknown',
-                        })
-                    except Exception as me:
-                        logging.error(f"Error processing card inventory row: {me}")
-
             if not card_data:
                 logging.warning("No card inventory data found.")
         except Exception as e:
-            logging.error(f"Error in extract_card_inventory: {e}")
+            logging.error(f"Error in extract_card_inventory: {e}", exc_info=True)
 
         df = pd.DataFrame(card_data)
         if cache_callback:
@@ -586,73 +897,45 @@ class Script(BaseScript):
         cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
         ip: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Parse 'show slots * inventory slots *' — pluggable / sub-slot / OSC inventory."""
+        """Parse ``show slots * inventory slots *`` — pluggable / sub-slot inventory.
+
+        Only sub-slot rows (path length >= 2) are emitted; the parent
+        slot's bare ``- name : N`` marker carries no fields here.
+        """
         module_data = []
         try:
-            output = output.strip()
-            # Split into per-slot blocks (may be nested slot X/Y)
-            slot_blocks = re.split(r'(?=\bslot\s+\S+\s*[:/])', output, flags=re.IGNORECASE)
-            for block in slot_blocks:
-                if not block.strip():
+            for path, fields in self._walk_rls_yaml(output):
+                if len(path) < 2:
                     continue
-                slot_match = re.match(r'slot\s+(\S+)', block, re.IGNORECASE)
-                if not slot_match:
-                    continue
-                slot_id = slot_match.group(1).rstrip(':').strip()
-                pec_match = re.search(r'pec\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                serial_match = re.search(r'serial-number\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                hw_match = re.search(r'hardware-release\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                type_match = re.search(r'c-type\s*[:\s]+(\S+)', block, re.IGNORECASE)
-
-                pec = pec_match.group(1).strip() if pec_match else ''
-                serial_number = serial_match.group(1).strip() if serial_match else ''
-                hw_release = hw_match.group(1).strip() if hw_match else ''
-                module_type = type_match.group(1).strip() if type_match else 'Module'
+                slot_id = "/".join(path)
+                pec = fields.get("pec", "")
+                serial_number = fields.get("serial-number", "")
+                hw_release = fields.get("hardware-release", "")
+                ctype = fields.get("c-type", "")
+                admin_state = fields.get("admin-state", "")
 
                 if not pec and not serial_number:
                     continue
 
-                description = self.db_cache.lookup_part(pec) if pec else ''
+                description = self.db_cache.lookup_part(pec) if pec else ""
+                if not description:
+                    description = " | ".join(filter(None, [ctype, hw_release, admin_state])) or ctype
+
                 module_data.append({
                     'System Name': '',
-                    'System Type': '',
-                    'Type': module_type.title(),
-                    'Part Number': pec[:10] if pec else '',
+                    'System Type': hw_release,
+                    'Type': ctype or 'Module',
+                    'Part Number': pec,
                     'Serial Number': serial_number,
                     'Description': description,
-                    'Name': f"Module {slot_id}",
+                    'Name': f"Slot {slot_id}",
                     'Source': ip or 'Unknown',
                 })
-
-            # Fallback: tabular  SLOT  PEC  SERIAL
-            if not module_data:
-                pattern = re.compile(
-                    r"^\s*(\d+/\S+)\s+(\S+)\s+(\S+)\s*$",
-                    re.MULTILINE,
-                )
-                for match in pattern.finditer(output):
-                    try:
-                        slot_id = match.group(1).strip()
-                        pec = match.group(2).strip()
-                        serial_number = match.group(3).strip()
-                        description = self.db_cache.lookup_part(pec)
-                        module_data.append({
-                            'System Name': '',
-                            'System Type': '',
-                            'Type': 'Module',
-                            'Part Number': pec[:10],
-                            'Serial Number': serial_number,
-                            'Description': description,
-                            'Name': f"Module {slot_id}",
-                            'Source': ip or 'Unknown',
-                        })
-                    except Exception as me:
-                        logging.error(f"Error processing module inventory row: {me}")
 
             if not module_data:
                 logging.warning("No module inventory data found.")
         except Exception as e:
-            logging.error(f"Error in extract_module_inventory: {e}")
+            logging.error(f"Error in extract_module_inventory: {e}", exc_info=True)
 
         df = pd.DataFrame(module_data)
         if cache_callback:
@@ -700,321 +983,6 @@ class Script(BaseScript):
         print(df.to_string(index=False))
         return df
 
-    def extract_slot_info(
-        self,
-        output: str,
-        cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
-        ip: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Parse 'show slots *' — slot occupancy, provisioning, and form-factor state."""
-        slot_data = []
-        try:
-            output = output.strip()
-            # Split into per-slot blocks
-            slot_blocks = re.split(r'(?=\bslot\s+\S+\s*[:/])', output, flags=re.IGNORECASE)
-            for block in slot_blocks:
-                if not block.strip():
-                    continue
-                slot_match = re.match(r'slot\s+(\S+)', block, re.IGNORECASE)
-                if not slot_match:
-                    continue
-                slot_id = slot_match.group(1).rstrip(':').strip()
-
-                present_match = re.search(r'card-present\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                occupied_match = re.search(r'slot-occupied\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                provisioned_match = re.search(r'card-provisioned\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                auto_prov_match = re.search(r'auto-provisioning\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                form_factor_match = re.search(r'form-factor\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                parent_match = re.search(r'parent\s*[:\s]+(\S+)', block, re.IGNORECASE)
-
-                card_present = present_match.group(1).strip() if present_match else 'Unknown'
-                slot_occupied = occupied_match.group(1).strip() if occupied_match else 'Unknown'
-                card_provisioned = provisioned_match.group(1).strip() if provisioned_match else 'Unknown'
-                auto_prov = auto_prov_match.group(1).strip() if auto_prov_match else ''
-                form_factor = form_factor_match.group(1).strip() if form_factor_match else ''
-                parent = parent_match.group(1).strip() if parent_match else ''
-
-                extras = " | ".join(filter(None, [
-                    f"Auto-Prov: {auto_prov}" if auto_prov else '',
-                    f"Form: {form_factor}" if form_factor else '',
-                    f"Parent: {parent}" if parent else '',
-                ]))
-
-                slot_data.append({
-                    'System Name': '',
-                    'System Type': '',
-                    'Type': 'Slot',
-                    'Part Number': card_provisioned,
-                    'Present Type': card_present,
-                    'Serial Number': '',
-                    'Description': (
-                        f"Present: {card_present} | Occupied: {slot_occupied}"
-                        + (f" | {extras}" if extras else '')
-                    ),
-                    'Name': f"Slot {slot_id}",
-                    'Source': ip or 'Unknown',
-                })
-
-            # Fallback: tabular format
-            if not slot_data:
-                for raw_line in output.splitlines():
-                    line = raw_line.strip()
-                    if not line or not re.match(r"^\d+(?:/\S*)?\s+", line):
-                        continue
-                    tokens = line.split()
-                    if len(tokens) < 3:
-                        continue
-                    try:
-                        slot_id = tokens[0].strip()
-                        card_present = tokens[1].strip()
-                        slot_occupied = tokens[2].strip()
-                        card_provisioned = tokens[3].strip() if len(tokens) > 3 else ''
-                        slot_data.append({
-                            'System Name': '',
-                            'System Type': '',
-                            'Type': 'Slot',
-                            'Part Number': card_provisioned,
-                            'Present Type': card_present,
-                            'Serial Number': '',
-                            'Description': f"Present: {card_present} | Occupied: {slot_occupied}",
-                            'Name': f"Slot {slot_id}",
-                            'Source': ip or 'Unknown',
-                        })
-                    except Exception as me:
-                        logging.error(f"Error processing slot row: {me}")
-
-            if not slot_data:
-                logging.warning("No slot data found.")
-        except Exception as e:
-            logging.error(f"Error in extract_slot_info: {e}")
-
-        df = pd.DataFrame(slot_data)
-        if cache_callback:
-            cache_callback(df, 'slot_info')
-        print(df.to_string(index=False))
-        return df
-
-    def extract_redundancy_info(
-        self,
-        output: str,
-        cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
-        ip: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Parse 'show aps' — APS line protection switch state."""
-        redun_data = []
-        try:
-            output = output.strip()
-            # Each APS group may have: group-id, working-entity, protection-entity, switch-state
-            group_blocks = re.split(r'(?=\baps\s+\S+\s*[:/])', output, flags=re.IGNORECASE)
-            if len(group_blocks) <= 1:
-                group_blocks = [output]
-
-            for block in group_blocks:
-                if not block.strip():
-                    continue
-                group_match = re.search(r'aps\s+(\S+)', block, re.IGNORECASE)
-                group_id = group_match.group(1).rstrip(':').strip() if group_match else 'APS'
-
-                switch_match = re.search(r'switch-state\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                working_match = re.search(r'working-entity\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                protect_match = re.search(r'protection-entity\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                active_match = re.search(r'active-entity\s*[:\s]+(\S+)', block, re.IGNORECASE)
-
-                switch_state = switch_match.group(1).strip() if switch_match else 'Unknown'
-                working = working_match.group(1).strip() if working_match else 'Unknown'
-                protection = protect_match.group(1).strip() if protect_match else 'Unknown'
-                active = active_match.group(1).strip() if active_match else 'Unknown'
-
-                redun_data.append({
-                    'System Name': '',
-                    'System Type': '',
-                    'Type': 'APS',
-                    'Part Number': '',
-                    'Serial Number': '',
-                    'Description': (
-                        f"Switch: {switch_state} | Working: {working} | "
-                        f"Protection: {protection} | Active: {active}"
-                    ),
-                    'Name': f"APS {group_id}",
-                    'Source': ip or 'Unknown',
-                })
-
-            if not redun_data:
-                # Minimal single-row fallback
-                redun_data.append({
-                    'System Name': '',
-                    'System Type': '',
-                    'Type': 'APS',
-                    'Part Number': '',
-                    'Serial Number': '',
-                    'Description': output[:120].replace('\n', ' '),
-                    'Name': 'APS',
-                    'Source': ip or 'Unknown',
-                })
-        except Exception as e:
-            logging.error(f"Error in extract_redundancy_info: {e}")
-
-        df = pd.DataFrame(redun_data)
-        if cache_callback:
-            cache_callback(df, 'redundancy_info')
-        print(df.to_string(index=False))
-        return df
-
-    def extract_power_info(
-        self,
-        output: str,
-        cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
-        ip: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Parse 'show components component power-supply state' — PSU enabled/capacity/current/voltage."""
-        pf_data = []
-        try:
-            output = output.strip()
-            # Split by component / power-supply blocks
-            psu_blocks = re.split(
-                r'(?=\bcomponent\s+\S+\s*[:/]|\bpower-supply\s+\S+\s*[:/])',
-                output,
-                flags=re.IGNORECASE,
-            )
-            if len(psu_blocks) <= 1:
-                psu_blocks = [output]
-
-            for block in psu_blocks:
-                if not block.strip():
-                    continue
-                comp_match = re.search(r'(?:component|power-supply)\s+(\S+)', block, re.IGNORECASE)
-                comp_id = comp_match.group(1).rstrip(':').strip() if comp_match else 'PSU'
-
-                enabled_match = re.search(r'enabled\s*[:\s]+(true|false|\S+)', block, re.IGNORECASE)
-                capacity_match = re.search(r'capacity\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                in_curr_match = re.search(r'input-current\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                in_volt_match = re.search(r'input-voltage\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                out_curr_match = re.search(r'output-current\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                out_volt_match = re.search(r'output-voltage\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                out_pwr_match = re.search(r'output-power\s*[:\s]+(\S+)', block, re.IGNORECASE)
-
-                enabled = enabled_match.group(1).strip() if enabled_match else 'Unknown'
-                capacity = capacity_match.group(1).strip() if capacity_match else ''
-                in_curr = in_curr_match.group(1).strip() if in_curr_match else ''
-                in_volt = in_volt_match.group(1).strip() if in_volt_match else ''
-                out_curr = out_curr_match.group(1).strip() if out_curr_match else ''
-                out_volt = out_volt_match.group(1).strip() if out_volt_match else ''
-                out_pwr = out_pwr_match.group(1).strip() if out_pwr_match else ''
-
-                if enabled == 'Unknown' and not capacity and not in_volt:
-                    continue
-
-                pf_data.append({
-                    'System Name': '',
-                    'System Type': '',
-                    'Type': 'Power Supply',
-                    'Part Number': '',
-                    'Serial Number': '',
-                    'Description': " | ".join(filter(None, [
-                        f"Enabled: {enabled}",
-                        f"Cap: {capacity}W" if capacity else '',
-                        f"In: {in_volt}V/{in_curr}A" if in_volt or in_curr else '',
-                        f"Out: {out_volt}V/{out_curr}A/{out_pwr}W" if out_volt or out_pwr else '',
-                    ])),
-                    'Name': f"PSU {comp_id}",
-                    'Source': ip or 'Unknown',
-                })
-
-            if not pf_data:
-                logging.warning("No power supply data found.")
-        except Exception as e:
-            logging.error(f"Error in extract_power_info: {e}")
-
-        df = pd.DataFrame(pf_data)
-        if cache_callback:
-            cache_callback(df, 'power_info')
-        print(df.to_string(index=False))
-        return df
-
-    def extract_topology(
-        self,
-        output: str,
-        cache_callback: Optional[Callable[[pd.DataFrame, str], None]] = None,
-        ip: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Parse 'show lldp interfaces' — LLDP neighbor / port connectivity."""
-        topo_data = []
-        try:
-            output = output.strip()
-            # Split into per-interface blocks
-            iface_blocks = re.split(
-                r'(?=\binterface\s+\S+\s*[:/]|\bport\s+\S+\s*[:/])',
-                output,
-                flags=re.IGNORECASE,
-            )
-            for block in iface_blocks:
-                if not block.strip():
-                    continue
-                iface_match = re.search(r'(?:interface|port)\s+(\S+)', block, re.IGNORECASE)
-                if not iface_match:
-                    continue
-                interface = iface_match.group(1).rstrip(':').strip()
-
-                nbr_id_match = re.search(r'neighbor-id\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                sys_name_match = re.search(r'system-name\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                port_id_match = re.search(r'port-id\s*[:\s]+(\S+)', block, re.IGNORECASE)
-                port_desc_match = re.search(r'port-description\s*[:\s]+(.+)', block, re.IGNORECASE)
-
-                neighbor = nbr_id_match.group(1).strip() if nbr_id_match else ''
-                sys_name = sys_name_match.group(1).strip() if sys_name_match else ''
-                port_id = port_id_match.group(1).strip() if port_id_match else ''
-                port_desc = port_desc_match.group(1).strip() if port_desc_match else ''
-
-                connected_to = sys_name or neighbor or 'Unknown'
-                from_port = port_id or port_desc or ''
-
-                topo_data.append({
-                    'System Name': '',
-                    'System Type': '',
-                    'Type': 'LLDP',
-                    'Part Number': '',
-                    'Serial Number': '',
-                    'Description': f"Connected To: {connected_to} | Port: {from_port}",
-                    'Name': f"If {interface}",
-                    'Source': ip or 'Unknown',
-                })
-
-            # Fallback: tabular  INTERFACE  NEIGHBOR  PORT-ID
-            if not topo_data:
-                for raw_line in output.strip().splitlines():
-                    line = raw_line.strip()
-                    if not line or not re.match(r"^\S+/\S+", line):
-                        continue
-                    tokens = line.split()
-                    if len(tokens) < 2:
-                        continue
-                    try:
-                        interface = tokens[0].strip()
-                        connected_to = tokens[1].strip()
-                        from_port = tokens[2].strip() if len(tokens) >= 3 else ''
-                        topo_data.append({
-                            'System Name': '',
-                            'System Type': '',
-                            'Type': 'LLDP',
-                            'Part Number': '',
-                            'Serial Number': '',
-                            'Description': f"Connected To: {connected_to} | Port: {from_port}",
-                            'Name': f"If {interface}",
-                            'Source': ip or 'Unknown',
-                        })
-                    except Exception as me:
-                        logging.error(f"Error processing topology row: {me}")
-
-            if not topo_data:
-                logging.warning("No topology data found.")
-        except Exception as e:
-            logging.error(f"Error in extract_topology: {e}")
-
-        df = pd.DataFrame(topo_data)
-        if cache_callback:
-            cache_callback(df, 'topology')
-        print(df.to_string(index=False))
-        return df
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -1032,14 +1000,9 @@ class Script(BaseScript):
 
         processing_functions = [
             lambda out, cb: self.extract_shelf_detail(out, cb, ip_address),
-            lambda out, cb: self.extract_shelf_inventory(out, cb, ip_address),
             lambda out, cb: self.extract_card_inventory(out, cb, ip_address),
             lambda out, cb: self.extract_module_inventory(out, cb, ip_address),
             lambda out, cb: self.extract_software_info(out, cb, ip_address),
-            lambda out, cb: self.extract_slot_info(out, cb, ip_address),
-            lambda out, cb: self.extract_redundancy_info(out, cb, ip_address),
-            lambda out, cb: self.extract_power_info(out, cb, ip_address),
-            lambda out, cb: self.extract_topology(out, cb, ip_address),
         ]
 
         system_info = {'System Name': '', 'System Type': ''}
@@ -1083,23 +1046,8 @@ class Script(BaseScript):
             if "inventory slots" in command:
                 return bool(re.search(r"pec\s*[:\s]+\S+|serial-number\s*[:\s]+\S+", output, re.IGNORECASE))
 
-            if command.startswith("show slots") and "inventory" in command:
-                return bool(re.search(r"slot\s+\S+", output, re.IGNORECASE))
-
             if command.startswith("show software"):
                 return bool(re.search(r"active-version\s*[:\s]+\S+", output, re.IGNORECASE))
-
-            if command.startswith("show slots"):
-                return bool(re.search(r"slot\s+\S+", output, re.IGNORECASE))
-
-            if command.startswith("show aps"):
-                return bool(re.search(r"switch-state|aps\s+\S+", output, re.IGNORECASE))
-
-            if command.startswith("show components"):
-                return bool(re.search(r"enabled\s*[:\s]+\S+|capacity\s*[:\s]+\S+", output, re.IGNORECASE))
-
-            if command.startswith("show lldp"):
-                return bool(re.search(r"interface\s+\S+|neighbor-id", output, re.IGNORECASE))
 
             return len(output.strip()) > 10
 

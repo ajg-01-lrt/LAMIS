@@ -53,10 +53,12 @@ def _process_iac(data: bytes, sock: socket.socket) -> bytes:
             i += 2
 
         elif cmd == _SB:
-            # Subnegotiation: skip until IAC SE
+            # Subnegotiation: skip until IAC SE.
+            # Use i < len(data) so the final byte is consumed even when
+            # the block is unterminated (no IAC SE before end of buffer).
             i += 2
-            while i + 1 < len(data):
-                if data[i] == _IAC and data[i + 1] == _SE:
+            while i < len(data):
+                if i + 1 < len(data) and data[i] == _IAC and data[i + 1] == _SE:
                     i += 2
                     break
                 i += 1
@@ -92,9 +94,24 @@ def _process_iac(data: bytes, sock: socket.socket) -> bytes:
 # ---------------------------------------------------------------------------
 
 class Telnet:
-    """Minimal synchronous Telnet client with the same API as telnetlib.Telnet."""
+    """Minimal synchronous Telnet client with the same API as telnetlib.Telnet.
 
-    def __init__(self, host: str, port: int = 23, timeout: Optional[float] = None):
+    F004: Every connection is gated by ``utils.telnet_policy.enforce_telnet_policy``
+    unless the caller passes ``bypass_policy=True`` (used only by code paths
+    that *must* speak Telnet, e.g. TL1 against Ciena 6500). On policy refusal
+    a ``TelnetPolicyError`` is raised before the socket is opened — callers
+    are expected to catch it and treat the device as unreachable (log + skip)
+    rather than aborting the run.
+    """
+
+    def __init__(self, host: str, port: int = 23, timeout: Optional[float] = None,
+                 *, bypass_policy: bool = False, purpose: Optional[str] = None,
+                 skip_ssh_probe: bool = False):
+        # Imported lazily to avoid a circular import (telnet_policy → helpers
+        # → ... → utils.telnet would otherwise loop during package init).
+        from utils.telnet_policy import enforce_telnet_policy
+        enforce_telnet_policy(host, port, bypass=bypass_policy, purpose=purpose,
+                              skip_ssh_probe=skip_ssh_probe)
         self._sock = socket.create_connection((host, port), timeout=timeout)
         self._default_timeout = timeout
         self._buf = b""
@@ -116,9 +133,23 @@ class Telnet:
     # Public API (matches telnetlib.Telnet)
     # ------------------------------------------------------------------
 
+    def _resolve_timeout(self, timeout: Optional[float]) -> float:
+        """F022: enforce a sane timeout floor so callers can't accidentally
+        spin in a non-blocking loop. ``None`` falls back to the per-instance
+        default (or 30 s); any positive value is floored at 0.1 s."""
+        if timeout is None:
+            timeout = self._default_timeout if self._default_timeout else 30
+        try:
+            t = float(timeout)
+        except (TypeError, ValueError):
+            t = 30.0
+        if t <= 0:
+            t = 0.1
+        return t
+
     def read_until(self, match: bytes, timeout: Optional[float] = None) -> bytes:
         """Read until *match* is found or *timeout* expires; return bytes read."""
-        deadline = time.monotonic() + (timeout or 30)
+        deadline = time.monotonic() + self._resolve_timeout(timeout)
         while True:
             idx = self._buf.find(match)
             if idx >= 0:
@@ -158,7 +189,7 @@ class Telnet:
     ) -> Tuple[int, Optional[re.Match], bytes]:
         """Wait for one of the regex *patterns* and return (index, match, data)."""
         compiled = [(i, re.compile(p)) for i, p in enumerate(patterns)]
-        deadline = time.monotonic() + (timeout or 30)
+        deadline = time.monotonic() + self._resolve_timeout(timeout)
         while True:
             for i, regex in compiled:
                 m = regex.search(self._buf)

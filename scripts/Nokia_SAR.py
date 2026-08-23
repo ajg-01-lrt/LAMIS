@@ -7,7 +7,10 @@ import pandas as pd
 import paramiko
 from typing import Callable, Dict, List, Optional, Tuple
 import serial
-from script_interface import BaseScript, DatabaseCache, get_inventory_db_path, get_tracker
+from script_interface import BaseScript, DatabaseCache, get_inventory_db_path, get_tracker, ssh_connect_with_credential_fallback, CredentialPromptRequired, NEEDS_CREDENTIALS_SENTINEL
+from utils.helpers import get_known_hosts_path, get_host_key_policy, safe_load_host_keys, safe_save_host_keys
+from utils.serial_helpers import serial_login, capture_until_prompt
+from utils.credentials import get_default_credentials_to_try
 
 class Script(BaseScript):
     def __init__(self, *,
@@ -87,7 +90,7 @@ class Script(BaseScript):
             'show chassis detail  | match "(Name.+)|(Type.+)|(Part.+)|(Serial.+)" pre-lines 1 expression',
             'show card a detail | match expression "(Slot)|(^A)|(Part number)|(Serial number)"',
             'show card b detail | match expression "(Slot)|(^B)|(Part number)|(Serial number)"',
-            'show mda detail | match "(Slot)|(up)|(Serial.+)|(Part.+)" post-lines 1 expression',
+            'show mda detail',
             'show port detail | match "(Optical Compliance.+)|(Serial.+)|(Model.+)|(Part.+)|(Interface +: [0-9/]+)" expression'
         ]
 
@@ -102,17 +105,41 @@ class Script(BaseScript):
     def execute_ssh_commands(self, ip_address: str, username: str, password: str, commands: List[str]) -> Tuple[List[str], Optional[str]]:
         shell = None
         try:
+            # Nokia 7705/7250 SSH servers don't support exec_command and close the
+            # transport when the identification shell channel ends — always open a
+            # fresh connection here.
+            injected = getattr(self, '_injected_ssh_client', None)
+            self._injected_ssh_client = None
+            if injected is not None:
+                try:
+                    injected.close()
+                except Exception:
+                    pass
+
+            _kh = str(get_known_hosts_path())
             self.ssh_client = paramiko.SSHClient()
             self.ssh_client.load_system_host_keys()
-            self.ssh_client.set_missing_host_key_policy(paramiko.WarningPolicy())
+            safe_load_host_keys(self.ssh_client, _kh)
+            self.ssh_client.set_missing_host_key_policy(get_host_key_policy())
             logging.info(f"Connecting to {ip_address}")
-            self.ssh_client.connect(ip_address,
-                               username=username,
-                               password=password, 
-                               look_for_keys=False,
-                               allow_agent=False,
-                               timeout=10
-                               )
+            try:
+                used_user, used_pass = ssh_connect_with_credential_fallback(
+                    self.ssh_client,
+                    ip_address,
+                    username,
+                    password,
+                    timeout=10,
+                )
+            except CredentialPromptRequired:
+                logging.info(
+                    f"Default credentials exhausted for {ip_address}; "
+                    f"parking in pause queue for user-credential entry"
+                )
+                return [], NEEDS_CREDENTIALS_SENTINEL
+            except paramiko.AuthenticationException as ae:
+                logging.error(f"Authentication failed for {ip_address}: {ae}")
+                return [], f"Authentication failed for {ip_address}. Skipping this device."
+            safe_save_host_keys(self.ssh_client, _kh)
             logging.info(f"Connected to {ip_address}")
 
             shell = self.ssh_client.invoke_shell()
@@ -139,16 +166,16 @@ class Script(BaseScript):
             if shell is not None:
                 try:
                     shell.close()
-                except Exception as e:
-                    logging.debug(f"Error closing shell: {e}")
+                except Exception:
+                    pass
             if self.ssh_client is not None:
                 try:
                     self.ssh_client.close()
-                except Exception as e:
-                    logging.debug(f"Error closing SSH client: {e}")
+                except Exception:
+                    pass
             self.ssh_client = None
 
-    def capture_full_output_ssh(self, shell, command: str) -> str:
+    def capture_full_output_ssh(self, shell, command: str) -> Optional[str]:
         try:
             logging.debug(f"Executing command: {command}")
             shell.send(command + '\n')
@@ -158,18 +185,13 @@ class Script(BaseScript):
                 if self.should_stop():
                     return None
                 if shell.recv_ready():
-                    chunk = shell.recv(65535).decode('utf-8')
+                    chunk = shell.recv(65535).decode('utf-8', errors='replace')
                     output += chunk
                     if "Press any key to continue" in chunk:
                         shell.send(' ')
                         output = output.replace("Press any key to continue (Q to quit)", "")
                         if self.sleep_with_abort(2):
                             return None
-                    if shell.recv_stderr_ready():
-                        error_chunk = shell.recv_stderr(65535).decode('utf-8')
-                        if error_chunk:
-                            logging.error(f"Error output: {error_chunk}")
-                            break
                 else:
                     if self.sleep_with_abort(1):
                         return None
@@ -177,17 +199,39 @@ class Script(BaseScript):
                         break
 
             logging.debug(f"Output: {output}")
-
             return output
 
         except Exception as e:
-            logging.error(f"Exception in executing command: {e}")
+            logging.error(f"Exception executing command: {e}")
             return None
 
     def execute_serial_commands(self, commands: List[str]) -> Tuple[List[str], Optional[str]]:
         try:
             self.serial_port_obj = serial.Serial(self.serial_port, self.baud_rate, timeout=self.timeout)
             logging.info(f"Connected to serial port {self.serial_port}")
+
+            # Authenticate against the console using the default credential
+            # list (same seed pool as bulk SSH). Caller-supplied user/pass
+            # is tried first so a primary set from the GUI still wins.
+            defaults = []
+            if self.username and self.password:
+                defaults.append((self.username, self.password))
+            for pair in get_default_credentials_to_try():
+                if pair not in defaults:
+                    defaults.append(pair)
+
+            ok, used = serial_login(
+                self.serial_port_obj,
+                defaults,
+                timeout=10.0,
+                should_stop=self.should_stop,
+            )
+            if not ok:
+                self.serial_port_obj.close()
+                self.serial_port_obj = None
+                return [], f"Serial login failed on {self.serial_port}: defaults exhausted."
+            if used:
+                logging.info(f"[SERIAL] Authenticated on {self.serial_port} as {used[0]!r}")
 
             outputs = []
             for command in commands:
@@ -213,38 +257,11 @@ class Script(BaseScript):
             self.serial_port_obj = None
             return [], str(e)
 
-        except Exception as e:
-            logging.error(f"Serial connection failed: {e}")
-            return [], str(e)
-
     def capture_full_output_serial(self, ser, command: str) -> str:
-        try:
-            logging.info(f"Executing command: {command}")
-            ser.write((command + '\n').encode())
-
-            output = ""
-            while True:
-                if self.sleep_with_abort(1):
-                    return None
-                chunk = ser.read(ser.in_waiting or 1).decode('utf-8')
-                logging.debug(f"Read chunk: {chunk}")  # Debugging output
-                if chunk:
-                    output += chunk
-                if "Press any key to continue" in chunk:
-                    ser.write(b' ')
-                    output = output.replace("Press any key to continue (Q to quit)", "")
-                    if self.sleep_with_abort(2):
-                        return None
-                if ser.in_waiting == 0:
-                    break
-
-            logging.debug(f"Output: {output}")
-
-            return output
-
-        except Exception as e:
-            logging.error(f"Exception in executing command: {e}")
-            return None
+        logging.info(f"Executing command: {command}")
+        return capture_until_prompt(
+            ser, command, timeout=20.0, should_stop=self.should_stop
+        )
 
 
     def extract_hardware_data(self, output: str, cache_callback: Callable[[pd.DataFrame, str], None], ip: str) -> None:
@@ -263,11 +280,13 @@ class Script(BaseScript):
             else:
                 logging.warning("No system information found in the output.")
 
-            # Refined pattern to capture Part/Serial/Type blocks
+            # `[ \t]*` (not `\s*`) around `:` so an empty value line cannot
+            # consume the trailing newline and capture the next line as the
+            # value — see card_detail_pattern for the same hardening.
             hardware_pattern = re.compile(
-                r"Part number\s*:\s*(?P<PartNumber>[^\r\n]+).*?"
-                r"Serial number\s*:\s*(?P<SerialNumber>[^\r\n]+).*?"
-                r"Type\s*:\s*(?P<Type>[^\r\n]+)",
+                r"Part number[ \t]*:[ \t]*(?P<PartNumber>[^\r\n]+).*?"
+                r"Serial number[ \t]*:[ \t]*(?P<SerialNumber>[^\r\n]+).*?"
+                r"Type[ \t]*:[ \t]*(?P<Type>[^\r\n]+)",
                 re.DOTALL | re.IGNORECASE
             )
 
@@ -345,11 +364,14 @@ class Script(BaseScript):
         card_data = []
 
         try:
-            # More flexible regex to match both Card A and B with irregular output structure
+            # Match Slot A/B + Type, then Part Number, then Serial Number.
+            # `[ \t]*` (not `\s*`) around `:` so an empty value line cannot
+            # consume the trailing newline and slurp the next line (e.g. the
+            # shell prompt) into the captured value.
             card_detail_pattern = re.compile(
-                r"^[ ]*(?P<Slot>[A-Z])\s+(?P<Type>[^\s]+).*?"          # Match Slot A/B and Type
-                r"Part number\s*:\s*(?P<PartNumber>[^\n]+).*?"         # Match Part Number
-                r"Serial number\s*:\s*(?P<SerialNumber>[^\n]+)",       # Match the correct Serial Number
+                r"^[ ]*(?P<Slot>[A-Z])\s+(?P<Type>[^\s]+).*?"
+                r"Part number[ \t]*:[ \t]*(?P<PartNumber>[^\r\n]+).*?"
+                r"Serial number[ \t]*:[ \t]*(?P<SerialNumber>[^\r\n]+)",
                 re.MULTILINE | re.DOTALL
             )
 
@@ -422,56 +444,125 @@ class Script(BaseScript):
 
     def extract_mda_details(self, output, cache_callback=None, ip=None):
         """
-        Extracts MDA details using regex to capture relevant fields.
+        Extracts MDA details from 'show mda detail' output.
+
+        Handles two cases:
+          - Provisioned MDAs (up or down): captured via their Provisioned Type.
+          - Equipped-but-unprovisioned MDAs: Provisioned Type is "(not provisioned)";
+            the Equipped Type is used as a fallback so the physical card is still recorded.
         """
         mda_data = []
 
         try:
             output = output.replace("Press any key to continue (Q to quit)", "").strip()
-
-            # When MDA is "(not provisioned)", the equipped type appears on the next line - collapse it onto the same line
-            output = re.sub(r'\(not provisioned\)\s*\n\s+(\S+)', r'\1', output)
-
-            # Combined regex to capture MDA, Type, Part Number, and Serial Number
-            mda_block_pattern = re.compile(
-                r"^\s*\d*\s+(?P<MDA>\d+)\s+(?P<Type>[\w\(\)\-\+]+).*?"
-                r"Part number\s*:\s*(?P<PartNumber>[^\r\n]+).*?"
-                r"Serial number\s*:\s*(?P<SerialNumber>[^\r\n]+)",
-                re.DOTALL | re.MULTILINE
-            )
-
             logging.debug(f"Raw MDA output:\n{output}")
 
-            match_found = False  # Flag to check if at least one match was found
+            # --- Primary: parse structured per-MDA detail blocks ---
+            # 'show mda detail' produces blocks separated by ===... / MDA N/M / ===... headers.
+            # Split on those separators so each chunk covers exactly one MDA.
+            #
+            # We capture the slot number directly from the header
+            # (``MDA 1/5 detail``) — the second group of N/M is the slot.
+            # The previous implementation searched the BODY for a line
+            # matching ``MDA   : N`` to extract the slot, but some cards
+            # (e.g. the 32-port T1/E1 ASAP ``a32-chds1v2``) format their
+            # specific-data section without that exact line, so the
+            # whole slot was silently dropped at the
+            # ``if not mda_m: continue`` check. Pulling the slot from
+            # the header is robust against per-card body variations.
+            block_splitter = re.compile(
+                r"={5,}[\s\S]*?MDA\s+(\d+)/(\d+)[\s\S]*?={5,}", re.MULTILINE
+            )
+            block_matches = list(block_splitter.finditer(output))
 
-            for match in mda_block_pattern.finditer(output):
-                match_found = True
-                part_number = match.group("PartNumber").strip()[:10] if match.group("PartNumber") else "Unknown"
-                serial_number = match.group("SerialNumber").strip() if match.group("SerialNumber") else "Unknown"
-                mda_type = match.group("Type").strip() if match.group("Type") else "Unknown"
+            detail_entries = {}  # mda_num -> entry dict (so duplicates from summary are avoided)
 
-                # Get part description
-                description = self.get_part_description(part_number)
+            if block_matches:
+                for i, match in enumerate(block_matches):
+                    start = match.start()
+                    end = block_matches[i + 1].start() if i + 1 < len(block_matches) else len(output)
+                    block = output[start:end]
 
-                entry = {
-                    'System Name': '',
-                    'System Type': '',
-                    'Type': mda_type,
-                    'Part Number': part_number,
-                    'Serial Number': serial_number,
-                    'Description': description,
-                    'Information Type': "MDA Card",
-                    'Name': match.group("MDA"),
-                    'Source': ip or 'Unknown'
-                }
+                    # Slot number from the matched header. Group 1 is
+                    # the chassis index (typically 1); group 2 is the
+                    # slot, which is what we want for the MDA Name.
+                    header_slot = match.group(2).strip()
 
-                logging.debug(f"Extracted MDA entry: {entry}")
-                mda_data.append(entry)
+                    prov_m = re.search(r'Provisioned Type\s*:\s*([^\r\n]+)', block, re.IGNORECASE)
+                    equip_m = re.search(r'Equipped Type\s*:\s*([^\r\n]+)', block, re.IGNORECASE)
+                    part_m = re.search(r'Part number[ \t]*:[ \t]*([^\r\n]+)', block, re.IGNORECASE)
+                    serial_m = re.search(r'Serial number[ \t]*:[ \t]*([^\r\n]+)', block, re.IGNORECASE)
 
-            # If no matches were found, log an error
-            if not match_found:
+                    if not part_m or not serial_m:
+                        continue
+
+                    mda_num = header_slot
+                    prov_type = prov_m.group(1).strip() if prov_m else ""
+                    equip_type = equip_m.group(1).strip() if equip_m else ""
+
+                    # Provisioned → use as-is.  Not provisioned → fall back to equipped type.
+                    if "(not provisioned)" in prov_type.lower() or not prov_type:
+                        mda_type = equip_type
+                    else:
+                        mda_type = prov_type
+
+                    if not mda_type or "(empty)" in mda_type.lower():
+                        continue  # Empty slot — nothing physically installed
+
+                    part_number = part_m.group(1).strip()[:10]
+                    serial_number = serial_m.group(1).strip()
+                    description = self.get_part_description(part_number)
+
+                    entry = {
+                        'System Name': '',
+                        'System Type': '',
+                        'Type': mda_type,
+                        'Part Number': part_number,
+                        'Serial Number': serial_number,
+                        'Description': description,
+                        'Information Type': "MDA Card",
+                        'Name': mda_num,
+                        'Source': ip or 'Unknown',
+                    }
+                    detail_entries[mda_num] = entry
+                    logging.debug(f"Detail-block MDA entry: {entry}")
+
+            mda_data.extend(detail_entries.values())
+
+            # --- Fallback: summary-table regex for outputs without detail blocks ---
+            # Collapse "(not provisioned)\n  <equipped_type>" lines before matching.
+            if not mda_data:
+                output_sub = re.sub(r'\(not provisioned\)\s*\n\s+(\S+)', r'\1', output)
+                summary_pattern = re.compile(
+                    r"^\s*\d*\s+(?P<MDA>\d+)\s+(?P<Type>[\w\(\)\-\+]+).*?"
+                    r"Part number[ \t]*:[ \t]*(?P<PartNumber>[^\r\n]+).*?"
+                    r"Serial number[ \t]*:[ \t]*(?P<SerialNumber>[^\r\n]+)",
+                    re.DOTALL | re.MULTILINE,
+                )
+                for match in summary_pattern.finditer(output_sub):
+                    mda_type = match.group("Type").strip()
+                    if "(not provisioned)" in mda_type.lower():
+                        continue
+                    part_number = match.group("PartNumber").strip()[:10]
+                    serial_number = match.group("SerialNumber").strip()
+                    description = self.get_part_description(part_number)
+                    entry = {
+                        'System Name': '',
+                        'System Type': '',
+                        'Type': mda_type,
+                        'Part Number': part_number,
+                        'Serial Number': serial_number,
+                        'Description': description,
+                        'Information Type': "MDA Card",
+                        'Name': match.group("MDA"),
+                        'Source': ip or 'Unknown',
+                    }
+                    logging.debug(f"Summary-table MDA entry: {entry}")
+                    mda_data.append(entry)
+
+            if not mda_data:
                 logging.error("No MDA details found in the provided output.")
-                return None  # Prevent further processing if no matches were found
+                return None
 
         except Exception as e:
             logging.error(f"Error extracting MDA details: {e}")
@@ -484,7 +575,7 @@ class Script(BaseScript):
                 'Description': 'Error',
                 'Information Type': 'Error',
                 'Name': 'Error',
-                'Source': 'Error'
+                'Source': 'Error',
             })
 
         # Convert to DataFrame
@@ -534,8 +625,23 @@ class Script(BaseScript):
                 logging.debug(f"Processing line: {line.strip()}")
 
                 if "Optical Compliance" in line:
-                    # 🔹 **Look back for related data** (Previous 5 lines max)
-                    for j in range(max(0, i - 5), i):
+                    # 🔹 **Look back for related data, CLOSEST line first**
+                    # (Previous 5 lines max). The `show port detail | match`
+                    # filter keeps an `Interface` line for EVERY port —
+                    # populated or not — but only emits Serial/Model/
+                    # Part/Optical Compliance for ports with an SFP. When
+                    # the previous port had no SFP (e.g., a 7705 SAR-8
+                    # a6-eth-10G card with empty xcme ports 1-4 followed
+                    # by an SFP on port 5), the look-back window contains
+                    # TWO Interface lines: the empty previous port and
+                    # the current populated one. Iterating forward (the
+                    # old behavior) picked the EARLIEST Interface — the
+                    # previous, empty port — and the SFP got reported
+                    # against the wrong port number (1/1/4 instead of
+                    # 1/1/5). Iterating backward picks the closest
+                    # Interface above the Optical Compliance line, which
+                    # is always the current port.
+                    for j in range(i - 1, max(-1, i - 6), -1):
                         if not current_interface:
                             interface_match = interface_pattern.search(lines[j])
                             if interface_match:

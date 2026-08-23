@@ -25,9 +25,8 @@ cffi==2.0.0
 psutil==7.2.2
 pywin32==311
 wexpect==4.0.0
-
-# Terminal/Documentation Support
-docx==0.2.4
+pexpect==4.9.0
+keyring==24.1.1
 
 # Deployment & Building
 pyinstaller==6.3.0
@@ -37,6 +36,11 @@ macholib==1.16.3
 pefile==2023.2.7
 setuptools==69.0.3
 packaging==23.2
+
+# AI Doc Search (optional — only needed when config.AI_ASSISTANT_ENABLED)
+# Versions below are what the feature was built and tested against.
+openai==2.44.0
+pypdf==6.14.2
 
 # Testing & Development
 pytest==9.0.3

@@ -11,9 +11,12 @@ import subprocess
 from openpyxl import load_workbook
 from typing import Callable, Dict, List, Optional, Tuple
 import serial
-from script_interface import BaseScript
+from script_interface import BaseScript, ssh_connect_with_credential_fallback, CredentialPromptRequired, NEEDS_CREDENTIALS_SENTINEL
+from utils.helpers import get_known_hosts_path, get_database_path, get_host_key_policy, safe_load_host_keys, safe_save_host_keys
+from utils.serial_helpers import serial_login, capture_until_prompt
+from utils.credentials import get_default_credentials_to_try
 
-db_path = os.path.join(os.path.dirname(__file__),"..", "data", "network_inventory.db")
+db_path = str(get_database_path())
 
 class Script(BaseScript):
     def __init__(self, db_name='network_inventory.db', connection_type='serial', **kwargs):
@@ -84,17 +87,41 @@ class Script(BaseScript):
     def execute_ssh_commands(self, ip_address: str, username: str, password: str, commands: List[str]) -> Tuple[List[str], Optional[str]]:
         shell = None
         try:
+            # Nokia 7250 IXR SSH servers don't support exec_command and close the
+            # transport when the identification shell channel ends — always open a
+            # fresh connection here.
+            injected = getattr(self, '_injected_ssh_client', None)
+            self._injected_ssh_client = None
+            if injected is not None:
+                try:
+                    injected.close()
+                except Exception:
+                    pass
+
+            _kh = str(get_known_hosts_path())
             self.ssh_client = paramiko.SSHClient()
             self.ssh_client.load_system_host_keys()
-            self.ssh_client.set_missing_host_key_policy(paramiko.WarningPolicy())
+            safe_load_host_keys(self.ssh_client, _kh)
+            self.ssh_client.set_missing_host_key_policy(get_host_key_policy())
             logging.info(f"Connecting to {ip_address}")
-            self.ssh_client.connect(ip_address,
-                               username=username,
-                               password=password, 
-                               look_for_keys=False,
-                               allow_agent=False,
-                               timeout=10
-                               )
+            try:
+                used_user, used_pass = ssh_connect_with_credential_fallback(
+                    self.ssh_client,
+                    ip_address,
+                    username,
+                    password,
+                    timeout=10,
+                )
+            except CredentialPromptRequired:
+                logging.info(
+                    f"Default credentials exhausted for {ip_address}; "
+                    f"parking in pause queue for user-credential entry"
+                )
+                return [], NEEDS_CREDENTIALS_SENTINEL
+            except paramiko.AuthenticationException as ae:
+                logging.error(f"Authentication failed for {ip_address}: {ae}")
+                return [], f"Authentication failed for {ip_address}. Skipping this device."
+            safe_save_host_keys(self.ssh_client, _kh)
             logging.info(f"Connected to {ip_address}")
 
             shell = self.ssh_client.invoke_shell()
@@ -121,16 +148,16 @@ class Script(BaseScript):
             if shell is not None:
                 try:
                     shell.close()
-                except Exception as e:
-                    logging.debug(f"Error closing shell: {e}")
+                except Exception:
+                    pass
             if self.ssh_client is not None:
                 try:
                     self.ssh_client.close()
-                except Exception as e:
-                    logging.debug(f"Error closing SSH client: {e}")
+                except Exception:
+                    pass
             self.ssh_client = None
 
-    def capture_full_output_ssh(self, shell, command: str) -> str:
+    def capture_full_output_ssh(self, shell, command: str) -> Optional[str]:
         try:
             logging.debug(f"Executing command: {command}")
             shell.send(command + '\n')
@@ -140,18 +167,13 @@ class Script(BaseScript):
                 if self.should_stop():
                     return None
                 if shell.recv_ready():
-                    chunk = shell.recv(65535).decode('utf-8')
+                    chunk = shell.recv(65535).decode('utf-8', errors='replace')
                     output += chunk
                     if "Press any key to continue" in chunk:
                         shell.send(' ')
                         output = output.replace("Press any key to continue (Q to quit)", "")
                         if self.sleep_with_abort(2):
                             return None
-                    if shell.recv_stderr_ready():
-                        error_chunk = shell.recv_stderr(65535).decode('utf-8')
-                        if error_chunk:
-                            logging.error(f"Error output: {error_chunk}")
-                            break
                 else:
                     if self.sleep_with_abort(1):
                         return None
@@ -159,17 +181,36 @@ class Script(BaseScript):
                         break
 
             logging.debug(f"Output: {output}")
-
             return output
 
         except Exception as e:
-            logging.error(f"Exception in executing command: {e}")
+            logging.error(f"Exception executing command: {e}")
             return None
 
     def execute_serial_commands(self, commands: List[str]) -> Tuple[List[str], Optional[str]]:
         try:
             self.serial_port_obj = serial.Serial(self.serial_port, self.baud_rate, timeout=self.timeout)
             logging.info(f"Connected to serial port {self.serial_port}")
+
+            defaults = []
+            if self.username and self.password:
+                defaults.append((self.username, self.password))
+            for pair in get_default_credentials_to_try():
+                if pair not in defaults:
+                    defaults.append(pair)
+
+            ok, used = serial_login(
+                self.serial_port_obj,
+                defaults,
+                timeout=10.0,
+                should_stop=self.should_stop,
+            )
+            if not ok:
+                self.serial_port_obj.close()
+                self.serial_port_obj = None
+                return [], f"Serial login failed on {self.serial_port}: defaults exhausted."
+            if used:
+                logging.info(f"[SERIAL] Authenticated on {self.serial_port} as {used[0]!r}")
 
             outputs = []
             for command in commands:
@@ -196,33 +237,10 @@ class Script(BaseScript):
             return [], str(e)
 
     def capture_full_output_serial(self, ser, command: str) -> str:
-        try:
-            logging.info(f"Executing command: {command}")
-            ser.write((command + '\n').encode())
-
-            output = ""
-            while True:
-                if self.sleep_with_abort(1):
-                    return None
-                chunk = ser.read(ser.in_waiting or 1).decode('utf-8')
-                logging.debug(f"Read chunk: {chunk}")  # Debugging output
-                if chunk:
-                    output += chunk
-                if "Press any key to continue" in chunk:
-                    ser.write(b' ')
-                    output = output.replace("Press any key to continue (Q to quit)", "")
-                    if self.sleep_with_abort(2):
-                        return None
-                if ser.in_waiting == 0:
-                    break
-
-            logging.debug(f"Output: {output}")
-
-            return output
-
-        except Exception as e:
-            logging.error(f"Exception in executing command: {e}")
-            return None
+        logging.info(f"Executing command: {command}")
+        return capture_until_prompt(
+            ser, command, timeout=20.0, should_stop=self.should_stop
+        )
     
     def get_part_description(self, part_number: str) -> str:
         """
@@ -268,11 +286,13 @@ class Script(BaseScript):
             else:
                 logging.warning("No system information found in the output.")
 
-            # Regex pattern to capture hierarchical part data
+            # `[ \t]*` (not `\s*`) around `:` so an empty value line cannot
+            # consume the trailing newline and capture the next line as the
+            # value — see card_detail_pattern for the same hardening.
             hardware_pattern = re.compile(
-                r"^\s+Part number\s*:\s*(?P<PartNumber>[^\r\n]+)\s*"
-                r"(?:CLEI code\s*:\s*[^\r\n]+\s*)?"  # CLEI code (optional)
-                r"Serial number\s*:\s*(?P<SerialNumber>[^\r\n]+)",
+                r"^\s+Part number[ \t]*:[ \t]*(?P<PartNumber>[^\r\n]+)\s*"
+                r"(?:CLEI code[ \t]*:[ \t]*[^\r\n]+\s*)?"  # CLEI code (optional)
+                r"Serial number[ \t]*:[ \t]*(?P<SerialNumber>[^\r\n]+)",
                 re.MULTILINE
             )
 
@@ -350,11 +370,14 @@ class Script(BaseScript):
         card_data = []
 
         try:
-            # More flexible regex to match both Card A and B with irregular output structure
+            # Match Slot A/B + Type, then Part Number, then Serial Number.
+            # `[ \t]*` (not `\s*`) around `:` so an empty value line cannot
+            # consume the trailing newline and slurp the next line (e.g. the
+            # shell prompt) into the captured value.
             card_detail_pattern = re.compile(
-                r"^[ ]*(?P<Slot>[A-Z])\s+(?P<Type>[^\s]+).*?"          # Match Slot A/B and Type
-                r"Part number\s*:\s*(?P<PartNumber>[^\n]+).*?"         # Match Part Number
-                r"Serial number\s*:\s*(?P<SerialNumber>[^\n]+)",       # Match the correct Serial Number
+                r"^[ ]*(?P<Slot>[A-Z])\s+(?P<Type>[^\s]+).*?"
+                r"Part number[ \t]*:[ \t]*(?P<PartNumber>[^\r\n]+).*?"
+                r"Serial number[ \t]*:[ \t]*(?P<SerialNumber>[^\r\n]+)",
                 re.MULTILINE | re.DOTALL
             )
 
@@ -437,11 +460,13 @@ class Script(BaseScript):
             # When MDA is "(not provisioned)", the equipped type appears on the next line - collapse it onto the same line
             output = re.sub(r'\(not provisioned\)\s*\n\s+(\S+)', r'\1', output)
 
-            # Combined regex to capture MDA, Type, Part Number, and Serial Number
+            # Combined regex to capture MDA, Type, Part Number, and Serial Number.
+            # `[ \t]*` (not `\s*`) around `:` so empty value lines can't slurp
+            # the next line — see card_detail_pattern for the same hardening.
             mda_block_pattern = re.compile(
                 r"^\s*\d*\s+(?P<MDA>\d+)\s+(?P<Type>[\w\(\)\-\+]+).*?"
-                r"Part number\s*:\s*(?P<PartNumber>[^\r\n]+).*?"
-                r"Serial number\s*:\s*(?P<SerialNumber>[^\r\n]+)",
+                r"Part number[ \t]*:[ \t]*(?P<PartNumber>[^\r\n]+).*?"
+                r"Serial number[ \t]*:[ \t]*(?P<SerialNumber>[^\r\n]+)",
                 re.DOTALL | re.MULTILINE
             )
 

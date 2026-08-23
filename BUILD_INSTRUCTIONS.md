@@ -1,291 +1,347 @@
-# LAMIS Build & Deployment Guide
+# ATLAS Build & Deployment Guide
 
-This guide covers building LAMIS into a professional Windows installer.
+This document covers building ATLAS (formerly LAMIS) into a Windows installer.
+
+The pipeline is:
+
+1. **PyInstaller** packages the GUI (`ATLAS.exe`) and the TDS subprocess
+   (`TDS.exe`) into `dist\ATLAS\` from a single spec file (`ATLAS.spec`).
+2. **NSIS** wraps that folder into a per-user installer at
+   `dist\ATLAS_Setup.exe`.
+3. **`build.bat`** drives both steps and (optionally) signs the artifacts.
+
+The spec file is the source of truth for hidden imports, bundled data files,
+and the two-executable layout. Do **not** rebuild by passing CLI flags to
+`pyinstaller`; that regenerates the spec from scratch and drops the
+hidden-import list, which breaks the keyring backend, dynamic device-script
+imports, and the TDS subprocess.
+
+---
 
 ## Prerequisites
 
-### 1. Install NSIS (Nullsoft Scriptable Install System)
-- Download: https://nsis.sourceforge.io/Download
-- Version: 3.x or later
-- After install, verify: `makensis /version` in command prompt
+### 1. Python 3.12 environment
 
-### 2. Verify All Dependencies
-```bash
+Use the project's virtual env if you have it; otherwise create one:
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Prepare Icon (Optional but Recommended)
-- Create or provide `icon.ico` in the project root (256×256 pixels minimum)
-- If not present, build will proceed without icon
+For supply-chain-verified installs, use the hash-pinned lock file:
 
-## Build Process
-
-### Step 1: Build Onedir Executable
-
-```bash
-# Simple: build using provided script
-build.bat
-
-# Or manual with full control:
-pyinstaller --onedir --windowed --name "LAMIS" ^
-  --add-data "L.A.M.I.S Logo.png:." ^
-  --add-data "data:data" ^
-  --collect-all paramiko ^
-  --collect-all openpyxl ^
-  --collect-all pandas ^
-  --collect-all PIL ^
-  --icon icon.ico ^
-  main.py
+```bat
+pip install --require-hashes -r requirements.lock
 ```
 
-**Output:** `dist/LAMIS/` folder containing:
-- `LAMIS.exe` — main executable
-- All dependencies (numpy, pandas, paramiko, etc.)
-- Bundled `data/` folder with templates
-- Bundled `L.A.M.I.S Logo.png`
+Regenerate the lock after upgrading anything in `requirements.txt`:
 
-### Step 2: Test Executable Locally
-
-```bash
-# Test the built executable
-dist/LAMIS/LAMIS.exe
+```bat
+python scripts\generate_requirements_lock.py
 ```
 
-Verify:
-- ✅ GUI loads correctly
-- ✅ Logo displays on splash screen
-- ✅ Can scan devices (if network available)
-- ✅ Can generate inventory workbooks
-- ✅ Packing slip modes work
+### 2. NSIS (Nullsoft Scriptable Install System)
 
-### Step 3: Build Installer
-
-```bash
-# Install NSIS (one-time)
+```bat
 choco install nsis -y
-# or download from https://nsis.sourceforge.io/Download
-
-# Build installer
-makensis LAMIS.nsi
 ```
 
-**Output:** `dist/LAMIS_Setup.exe` (~120-150MB)
+Or download manually from <https://nsis.sourceforge.io/Download>. After
+install, verify with `makensis /VERSION`.
 
-### Step 4: Test Installer
+### 3. icon.ico
 
-```bash
-# Run installer
-dist/LAMIS_Setup.exe
+A 256×256 `icon.ico` must exist in the project root (the spec references it
+and the build aborts without it).
 
-# Uninstall and verify
-# Control Panel → Programs → Programs and Features → LAMIS → Uninstall
-```
+### 4. (Optional) Windows SDK for code signing
 
-Verify:
-- ✅ Installer starts cleanly
-- ✅ Installs to `C:\Program Files\LAMIS\`
-- ✅ Desktop shortcut created
-- ✅ Start Menu shortcuts created
-- ✅ Uninstaller works cleanly
-
-## Deployment
-
-### For Internal Team (No Signing Needed)
-
-Simply build and share:
-
-```bash
-# Build installer
-build.bat
-makensis LAMIS.nsi
-```
-
-**Distribution:**
-- Email: `dist/LAMIS_Setup.exe`
-- Shared drive: `\\company\software\LAMIS_Setup.exe`
-- Company portal or wiki
-
-**First Run:**
-- Users may see: "Windows protected your PC - Unknown publisher"
-- They click: **More info** → **Run anyway** (1 extra click, normal for internal tools)
-- After first run, Windows trusts it
-
----
-
-### For External Distribution (Professional Deployment)
-
-If you later distribute to external users, add code signing (see **Code Signing** section below)
-
-## Troubleshooting
-
-### Build Issues
-
-**Issue:** `PyInstaller not found`
-```bash
-pip install pyinstaller
-```
-
-**Issue:** `Data files not found`
-- Verify `L.A.M.I.S Logo.png` exists in project root
-- Verify `data/` folder contains `.xlsx` files
-- Run `build.bat` from project root directory
-
-**Issue:** Icon not appearing
-- Ensure `icon.ico` is in project root
-- Verify dimensions (at least 256×256)
-- Rebuild with `build.bat`
-
-### Runtime Issues
-
-**Issue:** `Logo doesn't display in built exe`
-- Root cause: Resource path mismatch in `main.py`
-- Fix: Ensure bundled file is at `L.A.M.I.S Logo.png` (exact name)
-- Verify in built exe: `dist/LAMIS/L.A.M.I.S Logo.png` exists
-
-**Issue:** Templates missing when generating inventory**
-- Verify: `dist/LAMIS/data/` contains all `.xlsx` files
-- Check: SQLite database (`network_inventory.db`) exists
-- Rebuild if missing
-
-**Issue:** Slow startup (3-5 seconds)**
-- Normal for onedir with dependencies
-- First launch creates Python bytecode cache
-- Subsequent launches faster
-
-### Installer Issues
-
-**Issue:** `makensis command not found`
-- NSIS not installed or not in PATH
-- Install from: https://nsis.sourceforge.io/Download
-- Restart command prompt after install
-
-**Issue:** `Cannot find dist/LAMIS`
-- Run `build.bat` first to generate dist folder
-- Verify build completed with: `dir dist/LAMIS/LAMIS.exe`
-
-## Cleanup
-
-```bash
-# Clean old builds before rebuilding
-build.bat --clean
-
-# Or manually
-rmdir /s /q dist
-rmdir /s /q build
-del LAMIS.spec
-```
-
-## File Checklist
-
-Before distributing, verify these files exist:
-
-```
-LAMIS/
-├── dist/LAMIS_Setup.exe              ← Installer (ready for distribution)
-├── dist/LAMIS/                       ← Built application (testing)
-│   ├── LAMIS.exe
-│   ├── L.A.M.I.S Logo.png
-│   ├── data/
-│   │   ├── network_inventory.db
-│   │   ├── LAMIS_Packing_Slip.xlsx
-│   │   ├── LAMIS_Consolidated_Packing_Slip.xlsx
-│   │   └── Device_Report_Template.xlsx
-│   └── _internal/                    ← All dependencies
-├── build.bat                         ← Build script
-├── LAMIS.nsi                         ← Installer script
-└── icon.ico                          ← (Optional, for branding)
-```
-
-## Version Updates
-
-When releasing a new version:
-1. Update version in `config.py` (if applicable)
-2. Update version in `LAMIS.nsi` (VIProductVersion)
-3. Run `build.bat --clean` to force rebuild
-4. Build installer: `makensis LAMIS.nsi`
-5. Test installer
-6. Rename: `LAMIS_Setup.exe` → `LAMIS_Setup_v1.0.0.exe` (for releases)
-
-## Code Signing (For IT Department Trust)
-
-Code signing prevents Windows Defender/SmartScreen warnings and tells IT that LAMIS is from a trusted publisher. **Required if your IT department enforces signed software policies.**
-
-### Prerequisites
-
-**1. Get a Code Signing Certificate**
-
-Contact your IT department first — they may already have one via:
-- Internal PKI / Active Directory Certificate Services (free)
-- Company DigiCert/Sectigo subscription (ask IT)
-
-If purchasing independently:
-- **DigiCert** — https://www.digicert.com/code-signing (~$150-300/year)
-- **Sectigo** — https://sectigo.com/ssl-certificates/code-signing
-
-**2. Install Windows SDK (for signtool.exe)**
-
-```bash
+```bat
 choco install windows-sdk -y
 ```
 
-Or download: https://aka.ms/buildtools
-
-**3. Have your .pfx certificate file ready**
-
-Your certificate will be provided as a `.pfx` file with a password.
-
 ---
 
-### Build & Sign (All-in-One)
+## Build process
 
-```bash
-# Build + sign everything in one command
-build.bat --sign "certs\LightRiver_codesign.pfx"
+### Quick path
 
-# Clean build + sign
-build.bat --clean --sign "certs\LightRiver_codesign.pfx"
+```bat
+build.bat
 ```
 
-Enter password when prompted. Output:
-- `dist/LAMIS/LAMIS.exe` — signed executable
-- `dist/LAMIS_Setup.exe` — signed installer (no SmartScreen warning)
+Outputs:
+
+- `dist\ATLAS\ATLAS.exe`   — windowed GUI (smoke-test this before shipping)
+- `dist\ATLAS\TDS.exe`     — console TDS subprocess, spawned by the GUI
+- `dist\ATLAS\_internal\`  — shared dependencies (numpy, pandas, paramiko, …)
+- `dist\ATLAS_Setup.exe`   — final per-user installer
+
+### Common options
+
+```bat
+build.bat                      :: build + sign (signs by default)
+build.bat --clean              :: wipe build\ and dist\ first, then build + sign
+build.bat --release            :: also delete dist\ATLAS\ at the end
+                                  (keeps only the Setup.exe for distribution)
+build.bat --no-sign            :: build without signing (debug / CI)
+build.bat --sign other.pfx     :: sign with a non-default cert
+build.bat --clean --release    :: full release build (signed)
+```
+
+**Signing is on by default.** The build looks for the cert at
+`certs\LightRiver_codesign.pfx` (gitignored) and prompts for its
+password each run. If the cert is missing the build aborts with a
+message — either drop the `.pfx` at that path or pass `--no-sign`. To
+use a different cert path on the fly, pass `--sign path\to\other.pfx`.
+
+By default the unpacked `dist\ATLAS\` folder is preserved so you can run
+`ATLAS.exe` directly to smoke-test before installing. Add `--release` when
+you're confident and ready to ship only the installer.
+
+### What the spec actually bundles
+
+Hidden imports baked into `ATLAS.spec` (because static analysis can't see
+them):
+
+- **Dynamic device scripts** — `scripts.Nokia_SAR`, `Nokia_IXR`,
+  `Nokia_1830`, `Nokia_PSI`, `Ciena_6500`, `Ciena_RLS`, `Ciena_SAOS_Inv`,
+  `Ciena_SAOS10_Inv`, `Smartoptics_DCP`, plus the `scripts.Network.*`
+  provisioning variants. The GUI loads these via `importlib.import_module()`.
+- **Keyring's Windows backend** — `keyring.backends.Windows` and
+  `keyring.backends.fail`. Without these, the Windows Credential Manager
+  integration silently falls back to "no backend available" at runtime.
+- **pywin32** — `win32api`, `win32cred`, `win32event`, `pywintypes`,
+  `pythoncom` (used by keyring and by `utils.helpers.restrict_path_to_owner`).
+- **`ping3`** and **`pexpect`** fallbacks.
+
+`collect_all()` is also called for `paramiko`, `openpyxl`, `pandas`, `PIL`,
+`serial`, `cryptography`, `keyring`, `wexpect`, and the project's own
+`scripts` package, so data files and submodules come along.
 
 ---
 
-### Sign Separately (If Already Built)
+## Test the unpacked build before installing
 
-```bash
-# Sign both exe and installer
-sign.bat "certs\LightRiver_codesign.pfx"
+```bat
+dist\ATLAS\ATLAS.exe
+```
 
-# Sign only the installer
-sign.bat "certs\LightRiver_codesign.pfx" --installer-only
+Quick checklist:
+
+- [x] Loading screen displays the ATLAS logo (proves `ATLAS Logo.png` is bundled)
+- [x] Main window opens with tabs: Inventory, Packing Slip, TDS, Provision, Raw
+- [x] **Inventory** — can save credentials (proves `keyring` + `cryptography`
+      backends bundled)
+- [x] **Inventory** — can identify a device (proves dynamic `scripts.*` imports work)
+- [x] **TDS** — clicking Run on a configured host actually launches
+      `TDS.exe` as a subprocess (check Task Manager). Before this fix, the
+      TDS tab silently re-launched ATLAS.exe.
+- [x] Packing Slip generation produces an `.xlsx` from the templates
+
+Logs are written to `%APPDATA%\ATLAS\logs\ATLAS_*.log` — check there for
+any startup errors.
+
+---
+
+## Build the installer separately (if you skipped build.bat)
+
+```bat
+makensis ATLAS.nsi
+```
+
+`ATLAS.nsi` is a **per-user installer**:
+
+- No UAC elevation prompt.
+- Installs to `%LOCALAPPDATA%\Programs\ATLAS\` (the modern convention used
+  by VS Code, Chrome, etc.).
+- Registers itself under `HKCU` so the Apps & Features entry belongs to the
+  user who installed it. The legacy `HKCU`-while-installed-by-admin layout
+  meant uninstall never showed up for the actual user.
+
+If you need a system-wide install instead, edit `ATLAS.nsi` and change:
+
+- `RequestExecutionLevel user` → `admin`
+- `InstallDir "$LOCALAPPDATA\Programs\ATLAS"` → `"$PROGRAMFILES\ATLAS"`
+- All `HKCU` → `HKLM`
+
+---
+
+## Test the installer
+
+```bat
+dist\ATLAS_Setup.exe
+```
+
+Expected behaviour:
+
+- No UAC prompt
+- Installs to `%LOCALAPPDATA%\Programs\ATLAS\`
+- Desktop and Start Menu shortcuts are created
+- "ATLAS" shows up in **Settings → Apps & installed apps**, uninstallable
+  by the same user
+
+After install, runtime data lives separately under `%APPDATA%\ATLAS\`:
+
+```text
+%APPDATA%\ATLAS\
+├── logs\                       ← rotating ATLAS_*.log files
+├── credentials_config.json     ← encrypted defaults (Fernet)
+├── .creds_key                  ← Fernet key, ACL-restricted to the user
+├── known_hosts                 ← SSH TOFU host keys
+├── network_inventory.db        ← seeded from the bundled copy on first run
+└── telnet_allowlist.json
+```
+
+`%APPDATA%\ATLAS\` is preserved across uninstall/reinstall so saved
+credentials, host keys, and the inventory DB survive upgrades.
+
+---
+
+## Troubleshooting
+
+### Build issues
+
+**`PyInstaller not found`**
+
+```bat
+pip install pyinstaller
+```
+
+**`ATLAS.spec not found`**
+
+You're running the build from the wrong directory. `cd` into the project
+root (the folder that contains `main.py`, `ATLAS.spec`, and `build.bat`).
+
+**`dist\ATLAS\TDS.exe was not produced`**
+
+Almost certainly because `scripts\TDS\TDS_v6.2.py` was moved or renamed. The
+spec hardcodes that path. Restore the file or update `ATLAS.spec`.
+
+**NSIS `LAMIS.nsi has been retired`**
+
+You ran `makensis LAMIS.nsi` out of muscle memory. Use `makensis ATLAS.nsi`
+or just `build.bat`.
+
+### Runtime issues (in the installed app)
+
+#### Logo missing on the splash screen
+
+The bundled file must be at the bundle root with the exact name
+`ATLAS Logo.png`. Verify with:
+
+```bat
+dir "%LOCALAPPDATA%\Programs\ATLAS\_internal\ATLAS Logo.png"
+```
+
+#### "No recommended backend was available" when saving credentials
+
+`keyring.backends.Windows` wasn't bundled. Either the spec was regenerated
+by a stale `build.bat` (overwriting the hidden imports) or pywin32 isn't
+installed in the build environment. Reinstall deps and rebuild from the
+committed `ATLAS.spec`.
+
+#### TDS tab does nothing / re-launches the GUI
+
+The build dropped `TDS.exe`. Verify:
+
+```bat
+dir "%LOCALAPPDATA%\Programs\ATLAS\TDS.exe"
+```
+
+If missing, rebuild via `build.bat` (which fails fast when `TDS.exe` is
+missing post-build).
+
+#### Inventory scan fails with "Unsupported script selection"
+
+A dynamic device-script import is missing from the bundle. Confirm via:
+
+```bat
+dir "%LOCALAPPDATA%\Programs\ATLAS\_internal\scripts"
+```
+
+You should see `Nokia_SAR.pyc`, `Ciena_6500.pyc`, etc. If any are missing,
+the spec was tampered with — restore the committed `ATLAS.spec`.
+
+### Installer issues
+
+#### Installer succeeds but the app is missing from Apps & Features
+
+You're looking under the wrong user. The per-user installer registers under
+`HKCU` for the currently-logged-in user. If you ran the installer elevated
+(e.g. right-click → Run as administrator), it registered under the admin's
+HKCU. Re-install without elevating.
+
+---
+
+## Code signing (optional)
+
+Code signing prevents Defender SmartScreen warnings and satisfies IT
+policies that require signed binaries. Both `ATLAS.exe` and `TDS.exe`
+should be signed in addition to the installer.
+
+```bat
+:: All-in-one: clean build, sign every artifact (default), produce release installer
+build.bat --clean --release
+```
+
+Or sign after the fact:
+
+```bat
+sign.bat "certs\LightRiver_codesign.pfx"                  :: all three
+sign.bat "certs\LightRiver_codesign.pfx" --exe-only       :: ATLAS.exe + TDS.exe
+sign.bat "certs\LightRiver_codesign.pfx" --installer-only :: just Setup.exe
+```
+
+Store `*.pfx` files outside the repo (the project's `.gitignore` excludes
+`certs/`).
+
+---
+
+## Version updates
+
+1. Bump the version in `ATLAS.nsi` — both `VIProductVersion` and the
+   `DisplayVersion` reg writes.
+2. Bump the version in `config.py` if applicable.
+3. `build.bat --clean` to force a full rebuild.
+4. Smoke-test `dist\ATLAS\ATLAS.exe`.
+5. `build.bat --release` (or just rename `dist\ATLAS_Setup.exe` to include
+   the version, e.g. `ATLAS_Setup_v2.1.0.exe`).
+
+---
+
+## File checklist before distribution
+
+```text
+LAMIS/                             ← (folder still named LAMIS, app is ATLAS)
+├── dist\
+│   ├── ATLAS_Setup.exe            ← final deliverable
+│   └── ATLAS\                     ← (deleted by build.bat --release)
+│       ├── ATLAS.exe
+│       ├── TDS.exe
+│       ├── ATLAS Logo.png
+│       ├── icon.ico
+│       ├── data\
+│       │   ├── network_inventory.db
+│       │   ├── ATLAS_Packing_Slip.xlsx
+│       │   ├── ATLAS_Consolidated_Packing_Slip.xlsx
+│       │   ├── Device_Report_Template.xlsx
+│       │   ├── Ciena_RLS_*.xlsx
+│       │   └── Nokia_PSI_*.xlsx
+│       └── _internal\             ← all bundled dependencies
+├── ATLAS.spec                     ← source of truth for the build
+├── ATLAS.nsi                      ← per-user installer
+├── build.bat                      ← orchestrator
+├── sign.bat                       ← code signing
+└── icon.ico
 ```
 
 ---
 
-### What IT Will See
+## Support resources
 
-After signing, Windows shows:
-- ✅ **Verified Publisher:** Lightriver Technologies
-- ✅ **No SmartScreen warning**
-- ✅ **Passes Group Policy enforcement** (if configured for signed code only)
-
----
-
-### Storing the Certificate Securely
-
-- Keep `.pfx` file in a secure, non-committed location (not in git repo)
-- Add `certs/` to `.gitignore`
-- IT may prefer storing the cert in **Windows Certificate Store** instead of a file — ask them
-
-```bash
-# Add to .gitignore
-echo certs/ >> .gitignore
-```
-
-## Support Resources
-
-- **PyInstaller Docs:** https://pyinstaller.org/en/stable/
-- **NSIS Docs:** https://nsis.sourceforge.io/Docs/
-- **Python Packaging:** https://packaging.python.org/
+- PyInstaller — <https://pyinstaller.org/en/stable/>
+- NSIS — <https://nsis.sourceforge.io/Docs/>
+- Signtool — <https://learn.microsoft.com/windows/win32/seccrypto/signtool>

@@ -1,20 +1,22 @@
 import os
 import logging
 import re
+import ipaddress
 import sqlite3
 import time
 import pandas as pd
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
-    from wexpect import spawn, EOF, TIMEOUT
+    from wexpect import spawn, EOF, TIMEOUT  # type: ignore[import-not-found]
 except ImportError:
-    from redexpect import spawn, EOF, TIMEOUT
+    from pexpect import spawn, EOF, TIMEOUT  # type: ignore[import-not-found]
 
-from script_interface import BaseScript
+from script_interface import BaseScript, NEEDS_CREDENTIALS_SENTINEL
+from utils.helpers import ensure_host_key_known, get_known_hosts_path, get_database_path
 
 
-db_path = os.path.join(os.path.dirname(__file__), "..", "data", "network_inventory.db")
+db_path = str(get_database_path())
 
 class Script(BaseScript):
     def __init__(self, connection_type='ssh', **kwargs):
@@ -70,14 +72,33 @@ class Script(BaseScript):
 
     def execute_ssh_commands(self, ip_address: str, username: str, password: str, commands: List[str]) -> Tuple[List[str], Optional[str]]:
         try:
-            ssh_cmd = (
-                f"ssh -o StrictHostKeyChecking=no "
-                f"-o HostKeyAlgorithms=+ssh-rsa "
-                f"-o PubkeyAcceptedKeyTypes=+ssh-rsa "
-                f"-p {self.port} {ip_address}"
-            )
+            # Validate IP address format to prevent injection attacks
+            try:
+                ipaddress.ip_address(ip_address)
+            except ValueError:
+                return [], f"Invalid IP address format: {ip_address}"
+            
+            # Validate username to prevent injection (alphanumeric, dash, underscore, dot only)
+            if not re.match(r'^[a-zA-Z0-9._-]+$', username):
+                return [], f"Invalid username format: {username}"
+            
+            _kh = str(get_known_hosts_path())
+            if not ensure_host_key_known(str(ip_address), port=self.port):
+                return [], (
+                    f"SSH host key verification failed or rejected for "
+                    f"{ip_address}:{self.port}"
+                )
+            ssh_args = [
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", f"UserKnownHostsFile={_kh}",
+                "-o", "HostKeyAlgorithms=+ssh-rsa",
+                "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
+                "-p", str(self.port),
+                "-l", username,
+                str(ip_address),
+            ]
             logging.debug(f"Spawning SSH process to {ip_address}:{self.port}")
-            self.child = spawn(ssh_cmd, encoding='utf-8', timeout=30)
+            self.child = spawn("ssh", args=ssh_args, encoding='utf-8', timeout=30)
 
             output_log = []
 
@@ -111,7 +132,7 @@ class Script(BaseScript):
                 return [], "Aborted"
             if idx in [1, 2]:
                 logging.error("Authentication failed")
-                return [], "Authentication failed"
+                return [], NEEDS_CREDENTIALS_SENTINEL
 
             # Capture prompt
             prompt = self.child.after.strip()
@@ -234,11 +255,11 @@ class Script(BaseScript):
         system_info = {'System Name': 'Ciena 6500', 'System Type': 'Optical'}
         combined_output = "\n".join(raw_outputs)
 
-        # ✅ Dump output to file for debugging
-        debug_path = f"debug_raw_output_{ip_address.replace('.', '_')}.txt"
-        with open(debug_path, 'w', encoding='utf-8') as f:
-            f.write(combined_output)
-        logging.debug(f"Saved raw command output to {debug_path}")
+        # SECURITY: Raw output logged only at DEBUG level via the existing logging
+        # infrastructure (which applies CredentialFilter redaction). Do NOT write
+        # uncontrolled plaintext files to CWD — they expose sensitive device data,
+        # are world-readable, and leave indefinite forensic artifacts on disk.
+        logging.debug(f"Processing {len(raw_outputs)} raw output block(s) from {ip_address}")
 
         self.extract_data_to_df(
             combined_output,

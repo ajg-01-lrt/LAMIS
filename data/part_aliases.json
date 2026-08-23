@@ -1,0 +1,25 @@
+{
+  "_comment": "Maps Sales/marketing SKUs to the canonical Factory shipping part number used for BoM comparison. Both sides are folded to the canonical key before the missing-parts diff so vendor-extended or bundle SKUs on the Sales side and the bare shipping form on the Factory side don't show up as a false shortfall + matching surplus. The VALUE is the canonical Factory form used in current Live Inventory exports (typically the 12-char vendor-extended SKU). Add new pairs as { 'alias_pn': 'canonical_pn' }. Keys are matched case-insensitively after a 1P/P vendor-prefix strip.",
+  "aliases": {
+    "3HE13584AA":   "3HE11278AA",
+    "3KC72037AA":   "3KC72037AAAA",
+    "8DG59417AA":   "8DG59417AAXX",
+    "8DG59427AA":   "8DG59427AAXX",
+    "8DG60207AA":   "8DG60207AAAA",
+    "1AD1519300":   "1AD151930001",
+    "1AB2151200":   "1AB215120085"
+  },
+  "_kits_comment": "Kit groupings: a kit SKU plus its component SKUs. When ALL components are present on a side (per-site counts > 0 for each), the comparison rolls them into the kit count using min(component counts). If any component is missing on a side, the others stay listed as individual line items — no kit gets created. Spares are tracked separately and don't participate in kit folding.",
+  "kits": [
+    {
+      "kit": "3KC48900AA",
+      "kit_description": "PSS8 SHELF KIT -PSS8KIT (1XPSS8, 1X8FAN)",
+      "components": ["3KC48830AA", "3KC48850AA", "3KC48901AA"]
+    }
+  ],
+  "_excluded_comment": "Discontinued / non-comparable SKUs. Dropped from the BoM Compare entirely (Shortfall, Site Allocation, Trace) regardless of which side lists them. Each entry is { 'pn': '...', 'reason': '...' }. Keys matched case-insensitively after 1P/P vendor-prefix strip.",
+  "excluded_parts": [
+    { "pn": "3HE16718AA", "reason": "MDA - 2 x CFP2 (R6d) - CFP2 optic discontinued by vendor" },
+    { "pn": "3HE12518AA", "reason": "4P 10GE SFP+ + 1P 100GE CFP2 MDA - CFP2 optic discontinued by vendor" }
+  ]
+}

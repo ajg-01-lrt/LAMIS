@@ -1,8 +1,9 @@
-# Lightriver Automated Multivendor Inventory System (LAMIS)
+# Automated Toolkit for Lightriver Asset & Systems (ATLAS)
 
-A comprehensive network inventory and packing slip management system supporting Nokia (7705 SAR-8, 7250 IXR, 1830), Ciena 6500, and Smartoptics DCP devices.
+A comprehensive network device management platform supporting Nokia (7705 SAR-8, 7250 IXR, 1830), Ciena 6500, and Smartoptics DCP devices.
 
 **Key Features:**
+
 - Automated inventory collection via SSH/Telnet
 - Multi-device batch processing with ThreadPoolExecutor
 - Excel workbook generation with detailed device hardware reports
@@ -16,14 +17,14 @@ A comprehensive network inventory and packing slip management system supporting 
 - [Overview](#overview)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Building Executable](#building-executable)
+- [Building and Deployment](#building--deployment)
 - [Project Structure](#project-structure)
 - [Contributing](#contributing)
 - [License](#license)
 
 ## Overview
 
-LAMIS is a Python-based network inventory system designed to automate hardware discovery and asset documentation. The application:
+ATLAS is a Python-based network device management platform designed to automate hardware discovery, asset documentation, and device lifecycle operations. The application:
 
 - **Discovers devices** via SSH banner probing + full login authentication (with Telnet fallback)
 - **Collects hardware inventory** including chassis, cards, MDAs, and optical transceivers
@@ -33,6 +34,7 @@ LAMIS is a Python-based network inventory system designed to automate hardware d
 - **Logs all operations** with timestamped files for audit trails and debugging
 
 Supported devices:
+
 - **Nokia 7705 SAR-8 v2** — Supports chassis, control cards, MDAs (Ethernet, serial), ports
 - **Nokia 7250 IXR-R6 / IXR-R6d** — High-speed routing platform with 10G/100G interfaces
 - **Nokia 1830** — Compact transport platform
@@ -64,6 +66,7 @@ Supported devices:
 ## Usage
 
 1. **Run the application:**
+
    ```bash
    python main.py
    ```
@@ -95,18 +98,21 @@ Supported devices:
 ## Key Features & Recent Improvements
 
 ### Inventory Collection
+
 - **Auto-detection** — Identifies device type via SSH banner + login response parsing
 - **Multi-device batch processing** — Concurrent collection using ThreadPoolExecutor (max 2 workers)
 - **Fallback authentication** — SSH → Telnet fallback if SSH unavailable
 - **Error resilience** — Missing devices are logged but don't block others
 
 ### Excel Output
+
 - **Hardware inventory** — System name, type, part numbers, serial numbers, descriptions
 - **Per-device sheets** — Each device gets dedicated sheet in report workbook
 - **Auto-sizing** — Column widths automatically optimized for readability
 - **Summary integration** — Automatic Summary sheet with device list and metadata
 
 ### Packing Slips
+
 - **Individual mode** — One Excel workbook per device (ships with device)
 - **Consolidated mode** — All devices in single multi-row workbook (for receiving/shipping)
 - **From File mode** — Import pre-populated multi-sheet Excel files without device queries
@@ -114,14 +120,17 @@ Supported devices:
 - **Data validation** — Automatic row offset (row 15+) for device data rows
 
 ### Logging & Debugging
+
 - **Timestamped logs** — Each run creates `logs/LAMIS_YYYY-MM-DD_HH-MM-SS.log`
 - **Paramiko suppression** — SSH key exchange debug noise filtered; kept at WARNING level
 - **Query logging** — All commands and responses logged at DEBUG level
 - **Part lookup caching** — SQLite database avoids repeated lookups
 
 ### Testing
-- **41 unit tests** covering inventory collection, Excel generation, packing slip logic, multi-sheet handling
+
+- **44 unit tests** covering inventory collection, Excel generation, packing slip logic, multi-sheet handling, and upgrade/audit regressions
 - **Test command:** `python -m pytest tests/ -q`
+- **CI:** GitHub Actions runs `python -m pytest tests/ -q` on every push and pull request via `.github/workflows/tests.yml`
 
 ## Building & Deployment
 
@@ -149,6 +158,7 @@ makensis LAMIS.nsi
 ### Detailed Guide
 
 See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for:
+
 - Complete build process walkthrough
 - Testing and verification steps
 - Troubleshooting common issues
@@ -158,21 +168,24 @@ See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for:
 ## Troubleshooting
 
 **Device not identified:**
+
 - Check SSH/Telnet connectivity: `ssh user@device_ip` or `telnet device_ip`
 - Verify credentials are correct (same user/password for all devices)
 - Review `logs/LAMIS_*.log` for SSH error details
 
 **No port data in inventory:**
+
 - Expected behavior if device has no SFP transceivers installed (logged at DEBUG level)
 - Part number lookups for ports require entries in `data/network_inventory.db`
 
 **MDA/Card data missing:**
+
 - Ensure device supports the queried commands for your firmware version
 - Review device script for supported device types (SAR.py, IXR.py, etc.)
 
 ## Project Structure
 
-```
+```text
 LAMIS/
 ├── main.py                              # Entry point; logging configuration
 ├── script_interface.py                  # Device identification, script selection, command caching
@@ -216,7 +229,7 @@ LAMIS/
 │   └── LAMIS_YYYY-MM-DD_HH-MM-SS.log   # Timestamped log files (auto-created)
 │
 └── tests/
-    └── test_*.py                        # Unit tests (41 tests covering all major components)
+│   └── test_*.py                        # Unit tests (44 tests covering all major components)
 ```
 
 ## Contributing

@@ -4,7 +4,7 @@
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-BLUE  = "FF156082"
+BLUE  = "FF0087FF"
 WHITE = "FFFFFFFF"
 THIN  = Side(border_style="thin")
 
